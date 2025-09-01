@@ -67,6 +67,8 @@ let xrActive = false;
 // Physik (CANNON)
 // ==============================
 const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+world.broadphase = new CANNON.SAPBroadphase(world);
+world.allowSleep = true;
 const matBall  = new CANNON.Material('ball');
 const matWorld = new CANNON.Material('world');
 world.defaultContactMaterial.contactEquationStiffness = 1e7;
@@ -264,6 +266,9 @@ function spawnBall(origin, dir) {
   body.position.set(origin.x, origin.y, origin.z);
   body.velocity.set(dir.x * BALL_SPEED, dir.y * BALL_SPEED, dir.z * BALL_SPEED);
   body.angularVelocity.set((Math.random()-0.5)*5, (Math.random()-0.5)*5, (Math.random()-0.5)*5);
+
+  body.sleepSpeedLimit = 0.1;
+  body.sleepTimeLimit = 1.0;
 
   // No-collision Anlaufphase
   body.collisionResponse = false;
