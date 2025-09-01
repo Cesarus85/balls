@@ -1,4 +1,4 @@
-// --- Imports (fixierte Versionen) ---
+// --- Imports über Import-Map (siehe index.html) ---
 import * as THREE from 'three';
 import { ARButton } from 'three/addons/webxr/ARButton.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
@@ -10,10 +10,8 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.xr.enabled = true;
 
-// WICHTIG für Passthrough (Hintergrund durchsichtig):
-renderer.setClearAlpha(0); // oder:
-// renderer.setClearColor(0x000000, 0);
-
+// Passthrough sichtbar machen (transparentes WebGL-Canvas):
+renderer.setClearAlpha(0);
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -25,38 +23,60 @@ const dir = new THREE.DirectionalLight(0xffffff, 0.6);
 dir.position.set(1, 2, 1);
 scene.add(dir);
 
-// Dezentes Grid (y=0) – nur Debug/Orientierung
+// Debug-Grid (wird automatisch auf die erkannte Bodenhöhe verschoben)
 const grid = new THREE.GridHelper(4, 8, 0x888888, 0x444444);
-grid.position.y = 0;
 grid.material.opacity = 0.25;
 grid.material.transparent = true;
 scene.add(grid);
 
-// --- AR Button (ohne requiredFeatures) ---
+// --- AR Button / Session-Setup ---
 const sessionInit = {
-  // NUR optional → maximal kompatibel
+  // Nur optionale Features, damit der Button nicht verschwindet, wenn etwas fehlt
   optionalFeatures: [
     'local-floor', 'bounded-floor',
     'hit-test', 'anchors',
     'dom-overlay', 'hand-tracking'
   ],
-  // dom-overlay erlaubt HTML-Overlays in AR (optional)
   domOverlay: { root: document.body }
 };
 
-// Fallback-Hinweise, falls kein XR vorhanden (z. B. Desktop/kein HTTPS)
 if (!('xr' in navigator)) {
-  console.warn('WebXR nicht verfügbar. Öffne die Seite auf einer Meta Quest im Browser und nutze HTTPS.');
   showHint('⚠️ WebXR nicht verfügbar. Bitte auf der Quest im Meta-Browser per HTTPS öffnen.');
 }
-
-// Button anhängen
 const arBtn = ARButton.createButton(renderer, sessionInit);
 document.body.appendChild(arBtn);
 
-// Debug: Session-Events
-renderer.xr.addEventListener('sessionstart', () => showHint('✅ AR-Session gestartet (Passthrough aktiv)'));
-renderer.xr.addEventListener('sessionend',   () => showHint('ℹ️ AR-Session beendet'));
+// XR-Session / Hit-Test Variablen
+let xrSession = null;
+let viewerSpace = null;
+let refSpace = null;
+let hitTestSource = null;
+
+renderer.xr.addEventListener('sessionstart', async () => {
+  xrSession = renderer.xr.getSession();
+  refSpace = renderer.xr.getReferenceSpace();
+  try {
+    viewerSpace = await xrSession.requestReferenceSpace('viewer');
+    if (xrSession.requestHitTestSource) {
+      hitTestSource = await xrSession.requestHitTestSource({ space: viewerSpace });
+      showHint('👀 Bewege den Blick/Controller – Reticle zeigt Boden. Drücke Trigger zum Setzen.');
+    } else {
+      showHint('ℹ️ Hit-Test nicht verfügbar – Boden bleibt bei y=0.');
+    }
+  } catch (e) {
+    console.warn('Hit-Test Setup fehlgeschlagen:', e);
+    showHint('ℹ️ Hit-Test nicht verfügbar – Boden bleibt bei y=0.');
+  }
+});
+
+renderer.xr.addEventListener('sessionend', () => {
+  xrSession = null;
+  viewerSpace = null;
+  refSpace = null;
+  hitTestSource = null;
+  reticle.visible = false;
+  showHint('ℹ️ AR-Session beendet');
+});
 
 // --- Physik-Welt ---
 const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
@@ -69,11 +89,26 @@ world.addContactMaterial(new CANNON.ContactMaterial(matBall, matWorld, {
   restitution: 0.6
 }));
 
-// Boden-Plane (y=0)
+// Boden-Plane (zunächst y=0, später via Hit-Test gesetzt)
 const groundBody = new CANNON.Body({ mass: 0, material: matWorld });
 groundBody.addShape(new CANNON.Plane());
+// In Cannon zeigt die Standard-Plane normal nach +Z → -90° um X, damit normal nach +Y (Boden)
 groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+groundBody.position.set(0, 0, 0);
 world.addBody(groundBody);
+
+// Grid initial ausrichten
+grid.position.y = groundBody.position.y;
+
+// --- Reticle für Hit-Test ---
+const reticleGeo = new THREE.RingGeometry(0.06, 0.08, 32);
+reticleGeo.rotateX(-Math.PI / 2);
+const reticleMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.9 });
+const reticle = new THREE.Mesh(reticleGeo, reticleMat);
+reticle.visible = false;
+scene.add(reticle);
+
+let floorLocked = false;
 
 // --- Controller Setup ---
 const controller0 = renderer.xr.getController(0);
@@ -104,10 +139,17 @@ controller1.addEventListener('connected', onConnected);
 controller0.addEventListener('disconnected', function () { this.remove(this.children[0]); });
 controller1.addEventListener('disconnected', function () { this.remove(this.children[0]); });
 
+// Beim ersten Trigger: Boden setzen (falls Reticle sichtbar). Danach: linke Hand feuert.
 function onSelectStart(evt) {
-  if (!leftController) return;
-  if (evt.target !== leftController) return;
-  fireFromLeft();
+  // 1) Boden setzen?
+  if (!floorLocked && reticle.visible) {
+    lockFloorAtReticle();
+    return;
+  }
+  // 2) Sonst: nur wenn linke Hand triggert → feuern
+  if (leftController && evt.target === leftController) {
+    fireFromLeft();
+  }
 }
 controller0.addEventListener('selectstart', onSelectStart);
 controller1.addEventListener('selectstart', onSelectStart);
@@ -180,6 +222,20 @@ function fireFromLeft() {
   spawnBall(spawnPos, dir);
 }
 
+// --- Boden per Reticle setzen ---
+function lockFloorAtReticle() {
+  floorLocked = true;
+
+  // Bodenhöhe übernehmen (wir halten die Plane horizontal; Neigung kommt in M6/M7)
+  const y = reticle.position.y;
+  groundBody.position.y = y;
+  grid.position.y = y;
+
+  // Reticle ausblenden, Hinweis zeigen
+  reticle.visible = false;
+  showHint(`✅ Boden gesetzt (y=${y.toFixed(2)} m). Linken Trigger drücken, um Bälle zu feuern.`);
+}
+
 // --- Resize ---
 window.addEventListener('resize', onWindowResize, false);
 function onWindowResize() {
@@ -188,17 +244,39 @@ function onWindowResize() {
   renderer.setSize(window.innerWidth, window.innerHeight);
 }
 
-// --- Loop ---
+// --- Render/Physics Loop mit Hit-Test ---
 const fixedTimeStep = 1 / 60;
-renderer.setAnimationLoop(() => {
+
+renderer.setAnimationLoop((_, frame) => {
+  // Physik
   world.step(fixedTimeStep);
 
+  // Lebenszeit-Despawn
   const now = performance.now();
   for (let i = balls.length - 1; i >= 0; i--) {
     if (now - balls[i].bornAt > BALL_LIFETIME) removeBall(balls[i]);
   }
 
+  // XR Hit-Test aktualisieren (solange Boden noch nicht gesetzt)
+  if (frame && hitTestSource && !floorLocked && refSpace) {
+    const results = frame.getHitTestResults(hitTestSource);
+    if (results && results.length > 0) {
+      const pose = results[0].getPose(refSpace);
+      if (pose) {
+        reticle.visible = true;
+        reticle.position.set(pose.transform.position.x, pose.transform.position.y, pose.transform.position.z);
+
+        // Reticle zeigt „flach“ auf die Fläche; für M5 reicht die Position (Höhe).
+        // In M6/M7 orientieren wir Colliders passend zur Flächennormalen.
+      }
+    } else {
+      reticle.visible = false;
+    }
+  }
+
+  // Mesh-Transforms aus Physik übernehmen
   syncMeshesFromPhysics();
+
   renderer.render(scene, camera);
 });
 
@@ -218,6 +296,7 @@ function showHint(text) {
     el.style.background = 'rgba(0,0,0,0.6)';
     el.style.color = '#eee';
     el.style.borderRadius = '8px';
+    el.style.maxWidth = '80vw';
     document.body.appendChild(el);
   }
   el.textContent = text;
