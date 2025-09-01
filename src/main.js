@@ -67,8 +67,6 @@ let xrActive = false;
 // Physik (CANNON)
 // ==============================
 const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
-world.broadphase = new CANNON.SAPBroadphase(world);
-world.allowSleep = true;
 const matBall  = new CANNON.Material('ball');
 const matWorld = new CANNON.Material('world');
 world.defaultContactMaterial.contactEquationStiffness = 1e7;
@@ -236,7 +234,7 @@ function onSelectStart(evt) {
 // ==============================
 // Schüsse / Bälle
 // ==============================
-const balls = []; // { index, body, bornAt, noCollideUntil }
+const balls = []; // { mesh, body, bornAt, noCollideUntil }
 const BALL_RADIUS   = 0.02;
 const BALL_MASS     = 0.003;
 const BALL_SPEED    = 3.5;
@@ -247,37 +245,18 @@ const sharedBallGeometry = new THREE.SphereGeometry(BALL_RADIUS, 16, 12);
 const sharedBallMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.8, metalness: 0.0 });
 const sharedBallShape = new CANNON.Sphere(BALL_RADIUS);
 
-// Instanced mesh for all balls
-const ballMesh = new THREE.InstancedMesh(sharedBallGeometry, sharedBallMaterial, BALL_LIMIT);
-ballMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-scene.add(ballMesh);
-ballMesh.count = 0;
-
-// Transform storage and free-slot recycling
-const ballTransforms = Array(BALL_LIMIT).fill(null);
-const freeBallIndices = [];
-let nextBallIndex = 0;
-const _ballScale = new THREE.Vector3(1, 1, 1);
-const _hiddenMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
-
 function syncMeshesFromPhysics() {
   for (let i = 0; i < balls.length; i++) {
-    const { index, body } = balls[i];
-    let m = ballTransforms[index];
-    if (!m) {
-      m = new THREE.Matrix4();
-      ballTransforms[index] = m;
-    }
-    m.compose(body.position, body.quaternion, _ballScale);
-    ballMesh.setMatrixAt(index, m);
+    const { mesh, body } = balls[i];
+    mesh.position.copy(body.position);
+    mesh.quaternion.copy(body.quaternion);
   }
-  ballMesh.instanceMatrix.needsUpdate = true;
 }
 
 function spawnBall(origin, dir) {
   if (balls.length >= BALL_LIMIT) removeBall(balls[0]);
-
-  const index = freeBallIndices.length ? freeBallIndices.pop() : nextBallIndex++;
+  const mesh = new THREE.Mesh(sharedBallGeometry, sharedBallMaterial);
+  scene.add(mesh);
 
   const body = new CANNON.Body({ mass: BALL_MASS, material: matBall });
   body.addShape(sharedBallShape);
@@ -286,37 +265,22 @@ function spawnBall(origin, dir) {
   body.velocity.set(dir.x * BALL_SPEED, dir.y * BALL_SPEED, dir.z * BALL_SPEED);
   body.angularVelocity.set((Math.random()-0.5)*5, (Math.random()-0.5)*5, (Math.random()-0.5)*5);
 
-  body.sleepSpeedLimit = 0.1;
-  body.sleepTimeLimit = 1.0;
-
   // No-collision Anlaufphase
   body.collisionResponse = false;
 
   world.addBody(body);
 
-  const m = new THREE.Matrix4();
-  m.compose(body.position, body.quaternion, _ballScale);
-  ballMesh.setMatrixAt(index, m);
-  ballMesh.count = Math.max(ballMesh.count, index + 1);
-  ballTransforms[index] = m;
-  ballMesh.instanceMatrix.needsUpdate = true;
-
   const now = performance.now();
-  const item = { index, body, bornAt: now, noCollideUntil: now + BALL_NO_COLLISION_MS };
+  const item = { mesh, body, bornAt: now, noCollideUntil: now + BALL_NO_COLLISION_MS };
   balls.push(item);
   return item;
 }
 
 function removeBall(item) {
+  scene.remove(item.mesh);
   world.removeBody(item.body);
   const i = balls.indexOf(item);
   if (i !== -1) balls.splice(i, 1);
-
-  const idx = item.index;
-  ballTransforms[idx] = null;
-  ballMesh.setMatrixAt(idx, _hiddenMatrix);
-  ballMesh.instanceMatrix.needsUpdate = true;
-  freeBallIndices.push(idx);
 }
 
 function clearAllBalls() {
