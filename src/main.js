@@ -8,11 +8,11 @@ import * as CANNON from 'https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cann
 // ==============================
 // Konfiguration
 // ==============================
-const USE_SIMPLE_VIZ = false;           // einfache Controller-Viz statt GLTF
-const ENABLE_MESH_DEBUG = false;        // zeigt Raum-Mesh als Wireframe (nur Debug)
+const USE_SIMPLE_VIZ = false;
+const ENABLE_MESH_DEBUG = false;
 const MAX_MESHES = 40;
 const MAX_TRIANGLES_PER_MESH = 3000;
-const ACCEPT_SEMANTICS = null;          // z.B. ['floor','wall'] oder null für alle
+const ACCEPT_SEMANTICS = null;
 
 // ==============================
 // Renderer / Scene / Camera
@@ -21,7 +21,7 @@ const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.xr.enabled = true;
-renderer.setClearAlpha(0); // Passthrough sichtbar
+renderer.setClearAlpha(0); // Passthrough
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -33,7 +33,7 @@ const dir = new THREE.DirectionalLight(0xffffff, 0.6);
 dir.position.set(1, 2, 1);
 scene.add(dir);
 
-// Debug-Grid (wird auf Bodenhöhe verschoben)
+// Debug-Grid (auf Bodenhöhe verschoben)
 const grid = new THREE.GridHelper(4, 8, 0x888888, 0x444444);
 grid.material.opacity = 0.25;
 grid.material.transparent = true;
@@ -46,44 +46,17 @@ const sessionInit = {
   optionalFeatures: [
     'local-floor','bounded-floor',
     'hit-test','anchors','dom-overlay','hand-tracking',
-    // Raum-Mesh
     'mesh-detection'
   ],
   domOverlay: { root: document.body }
 };
 
-if (!('xr' in navigator)) showHint('⚠️ WebXR nicht verfügbar. Bitte auf einer Quest im Meta-Browser per HTTPS öffnen.');
+if (!('xr' in navigator)) showHint('⚠️ WebXR nicht verfügbar. Bitte auf der Quest im Meta-Browser per HTTPS öffnen.');
 const arBtn = ARButton.createButton(renderer, sessionInit);
 document.body.appendChild(arBtn);
 
-// XR-Variablen
 let xrSession = null, viewerSpace = null, refSpace = null, hitTestSource = null;
-
-renderer.xr.addEventListener('sessionstart', async () => {
-  xrSession = renderer.xr.getSession();
-  refSpace = renderer.xr.getReferenceSpace();
-  try {
-    viewerSpace = await xrSession.requestReferenceSpace('viewer');
-    if (xrSession.requestHitTestSource) {
-      hitTestSource = await xrSession.requestHitTestSource({ space: viewerSpace });
-      setSignText("👀 Schaue auf den Boden und platziere das Reticle.\nDrücke den TRIGGER der LINKEN Hand, um die Bodenhöhe zu setzen.");
-    } else {
-      setSignText("ℹ️ Hit-Test nicht verfügbar – Boden bleibt bei y=0.\nLinker Trigger: Bälle feuern • Rechter Trigger: Fläche platzieren • 🧹: Alle Bälle löschen");
-    }
-  } catch (e) {
-    console.warn('Hit-Test Setup fehlgeschlagen:', e);
-    setSignText("ℹ️ Hit-Test nicht verfügbar – Boden bleibt bei y=0.\nLinker Trigger: Bälle feuern • Rechter Trigger: Fläche platzieren • 🧹: Alle Bälle löschen");
-  }
-});
-
-renderer.xr.addEventListener('sessionend', () => {
-  xrSession = null; viewerSpace = null; refSpace = null; hitTestSource = null;
-  reticle.visible = false;
-  // Meshes aufräumen
-  for (const [meshKey, rec] of meshMap) removeMeshRecord(meshKey, rec);
-  meshMap.clear();
-  showHint('ℹ️ AR-Session beendet');
-});
+let xrActive = false; // <<< nur wenn true, UI anzeigen & updaten
 
 // ==============================
 // Physik (CANNON)
@@ -117,7 +90,30 @@ let floorLocked = false;
 let lastHitPose = null;
 
 // ==============================
-// Controller / Eingaben + Raycast
+// UI: Schild + Button (vorab erzeugen, aber unsichtbar bis XR)
+// ==============================
+let signMesh, setSignText;
+let buttonRoot, buttonFront, setButtonState;
+let interactive = []; // Raycast-Ziele
+
+({ signMesh, setSignText } = createBillboardSign(
+  "👀 Schaue auf den Boden und platziere das Reticle.\nDrücke den TRIGGER der LINKEN Hand, um die Bodenhöhe zu setzen."
+));
+signMesh.visible = false;
+scene.add(signMesh);
+
+({ buttonRoot, buttonFront, setButtonState } = createClearBallsButton());
+buttonRoot.visible = false;
+scene.add(buttonRoot);
+
+interactive = [buttonFront];
+
+// Raycaster (für Button)
+const raycaster = new THREE.Raycaster();
+let hovered = null;
+
+// ==============================
+// Controller / Eingaben
 // ==============================
 const controller0 = renderer.xr.getController(0);
 const controller1 = renderer.xr.getController(1);
@@ -125,8 +121,36 @@ scene.add(controller0, controller1);
 
 const controllerGrip0 = renderer.xr.getControllerGrip(0);
 const controllerGrip1 = renderer.xr.getControllerGrip(1);
-let controllerModelFactory = null;
 
+// --- Hilfsfunktionen (VOR Nutzung definiert!) ---
+function addSimpleControllerViz(grip){
+  const geo = new THREE.ConeGeometry(0.01, 0.08, 16);
+  const mat = new THREE.MeshStandardMaterial({ color: 0x8888ff, metalness: 0, roughness: 0.9 });
+  const cone = new THREE.Mesh(geo, mat);
+  cone.rotation.x = Math.PI / 2;
+  cone.position.z = -0.04;
+  grip.add(cone);
+}
+
+function addLeftGunBlock(grip) {
+  const geo = new THREE.BoxGeometry(0.10, 0.06, 0.16);
+  const mat = new THREE.MeshStandardMaterial({ color: 0x4aa3ff, metalness: 0.0, roughness: 0.9 });
+  const block = new THREE.Mesh(geo, mat);
+  block.position.set(0, 0, 0);
+  grip.add(block);
+}
+
+function buildControllerRay(controller){
+  const geometry = new THREE.BufferGeometry().setFromPoints([ new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,-1) ]);
+  const material = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.7 });
+  const line = new THREE.Line(geometry, material);
+  line.name = 'ray';
+  line.scale.z = 1.5;
+  controller.add(line);
+}
+
+// Controller-Modelle / Visualisierung
+let controllerModelFactory = null;
 if (USE_SIMPLE_VIZ) {
   addSimpleControllerViz(controllerGrip0);
   addSimpleControllerViz(controllerGrip1);
@@ -137,7 +161,7 @@ if (USE_SIMPLE_VIZ) {
 }
 scene.add(controllerGrip0, controllerGrip1);
 
-// Sichtbare Ray-Linien an den Controllern
+// Sichtbare Rays
 buildControllerRay(controller0);
 buildControllerRay(controller1);
 
@@ -150,7 +174,7 @@ function onConnected(event) {
   if (src.handedness === 'left') {
     leftController = this;
     leftGrip = (this === controller0) ? controllerGrip0 : controllerGrip1;
-    addLeftGunBlock(leftGrip);
+    addLeftGunBlock(leftGrip); // << jetzt definitiv definiert
   } else if (src.handedness === 'right') {
     rightController = this;
     rightGrip = (this === controller0) ? controllerGrip0 : controllerGrip1;
@@ -161,66 +185,43 @@ controller1.addEventListener('connected', onConnected);
 controller0.addEventListener('disconnected', function(){ this.remove(this.children[0]); });
 controller1.addEventListener('disconnected', function(){ this.remove(this.children[0]); });
 
-// Trigger-Handling:
-// 1) Boden setzen NUR mit linkem Trigger (solange Reticle sichtbar)
-// 2) rechter Trigger: Fläche platzieren (Box)
-// 3) linker Trigger (nach Floor-Lock): Bälle schießen
-// 4) auf Button zielen + Trigger: Bälle löschen
+// Trigger-Handling
 controller0.addEventListener('selectstart', onSelectStart);
 controller1.addEventListener('selectstart', onSelectStart);
 
 function onSelectStart(evt) {
+  if (!xrActive) return;
+
   const target = evt.target;
 
-  // Button-Klick testen (Raycast)
+  // 1) Button per Raycast?
   if (tryPressUIButton(target)) return;
 
-  // Boden setzen?
+  // 2) Boden setzen (nur linker Trigger, solange Reticle sichtbar)
   if (!floorLocked && target === leftController && reticle.visible) {
     lockFloorAtReticle();
     return;
   }
-  // Fläche platzieren?
+  // 3) Rechte Hand: Fläche platzieren
   if (target === rightController && reticle.visible && lastHitPose) {
     addPlaneColliderAtHit(lastHitPose);
     return;
   }
-  // Schießen (nach Floor-Lock)
+  // 4) Linke Hand (nach Floor-Lock): Bälle schießen
   if (floorLocked && target === leftController) {
     fireFromLeft();
   }
 }
 
 // ==============================
-// Einfache Controller-Viz (optional)
-function addSimpleControllerViz(grip){
-  const geo = new THREE.ConeGeometry(0.01, 0.08, 16);
-  const mat = new THREE.MeshStandardMaterial({ color: 0x8888ff, metalness: 0, roughness: 0.9 });
-  const cone = new THREE.Mesh(geo, mat);
-  cone.rotation.x = Math.PI / 2;
-  cone.position.z = -0.04;
-  grip.add(cone);
-}
-
-// Ray-Linie addieren
-function buildControllerRay(controller){
-  const geometry = new THREE.BufferGeometry().setFromPoints([ new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1) ]);
-  const material = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.7 });
-  const line = new THREE.Line(geometry, material);
-  line.name = 'ray';
-  line.scale.z = 1.5; // 1.5 m
-  controller.add(line);
-}
-
-// ==============================
 // Schüsse / Bälle
 // ==============================
 const balls = []; // { mesh, body, bornAt }
-const BALL_RADIUS   = 0.02;      // 2 cm Radius
-const BALL_MASS     = 0.003;     // ~3 g
-const BALL_SPEED    = 3.5;       // m/s
+const BALL_RADIUS   = 0.02;
+const BALL_MASS     = 0.003;
+const BALL_SPEED    = 3.5;
 const BALL_LIMIT    = 200;
-const BALL_LIFETIME = 20 * 1000; // 20 s
+const BALL_LIFETIME = 20 * 1000;
 
 function syncMeshesFromPhysics() {
   for (let i = 0; i < balls.length; i++) {
@@ -288,7 +289,7 @@ function lockFloorAtReticle() {
 }
 
 // ==============================
-// Manuelle Flächen (Box) – wie in M6
+// Manuelle Flächen (Box)
 const colliders = []; // { mesh, body }
 const DEFAULT_W = 1.0, DEFAULT_H = 1.0, THICK = 0.02;
 
@@ -296,7 +297,6 @@ function addPlaneColliderAtHit(pose) {
   const { position, orientation } = pose.transform;
   const q = orientation;
 
-  // Sichtbare Plane-Box
   const geo = new THREE.BoxGeometry(DEFAULT_W, THICK, DEFAULT_H);
   const mat = new THREE.MeshStandardMaterial({ color: 0x00ff88, transparent: true, opacity: 0.25 });
   const mesh = new THREE.Mesh(geo, mat);
@@ -304,7 +304,6 @@ function addPlaneColliderAtHit(pose) {
   mesh.quaternion.set(q.x, q.y, q.z, q.w);
   scene.add(mesh);
 
-  // Physik
   const half = new CANNON.Vec3(DEFAULT_W/2, THICK/2, DEFAULT_H/2);
   const body = new CANNON.Body({ mass: 0, material: matWorld });
   body.addShape(new CANNON.Box(half));
@@ -331,9 +330,7 @@ function handleDetectedMeshes(frame) {
   for (const xrmesh of detected) {
     if (count >= MAX_MESHES) break;
 
-    if (ACCEPT_SEMANTICS && xrmesh.semanticLabel && !ACCEPT_SEMANTICS.includes(xrmesh.semanticLabel)) {
-      continue;
-    }
+    if (ACCEPT_SEMANTICS && xrmesh.semanticLabel && !ACCEPT_SEMANTICS.includes(xrmesh.semanticLabel)) continue;
 
     const pose = frame.getPose(xrmesh.meshSpace, refSpace);
     if (!pose) continue;
@@ -432,12 +429,8 @@ function createTrimeshShapeCapped(verticesTyped, indicesTyped) {
     indices = indicesTyped;
   }
 
-  try {
-    return new CANNON.Trimesh(verticesTyped, indices);
-  } catch (e) {
-    console.warn('Trimesh-Erstellung fehlgeschlagen:', e);
-    return null;
-  }
+  try { return new CANNON.Trimesh(verticesTyped, indices); }
+  catch (e) { console.warn('Trimesh-Erstellung fehlgeschlagen:', e); return null; }
 }
 
 function removeMeshRecord(meshKey, rec) {
@@ -450,28 +443,10 @@ function removeMeshRecord(meshKey, rec) {
 }
 
 // ==============================
-// In-Scene UI: Schild + Button
+// UI-Objekte / Interaktion
 // ==============================
-
-// 1) Schild (CanvasTexture)
-const { signMesh, setSignText } = createBillboardSign(
-  "👀 Schaue auf den Boden und platziere das Reticle.\nDrücke den TRIGGER der LINKEN Hand, um die Bodenhöhe zu setzen."
-);
-scene.add(signMesh);
-
-// 2) Button „Alle Bälle löschen“
-const { buttonRoot, buttonFront, setButtonState } = createClearBallsButton();
-scene.add(buttonRoot);
-
-// Interaktives Array für Raycaster
-const interactive = [buttonFront];
-
-// Raycaster + Hover-State
-const raycaster = new THREE.Raycaster();
-let hovered = null;
-
 function tryPressUIButton(controller) {
-  // Ray von Controller ableiten
+  if (!xrActive) return false;
   const origin = new THREE.Vector3();
   const dir = new THREE.Vector3(0, 0, -1);
   controller.updateMatrixWorld(true);
@@ -481,20 +456,18 @@ function tryPressUIButton(controller) {
   raycaster.set(origin, dir);
   raycaster.far = 3.0;
   const hits = raycaster.intersectObjects(interactive, false);
-  if (hits.length > 0) {
-    const obj = hits[0].object;
-    if (obj === buttonFront) {
-      clearAllBalls();
-      setSignText("🧹 Alle Bälle gelöscht.\nLinker Trigger: Bälle • Rechter Trigger: Fläche • Reticle: Boden setzen");
-      flashButton(buttonRoot);
-      return true;
-    }
+  if (hits.length > 0 && hits[0].object === buttonFront) {
+    clearAllBalls();
+    setSignText("🧹 Alle Bälle gelöscht.\nLinker Trigger: Bälle • Rechter Trigger: Fläche • Reticle: Boden setzen");
+    flashButton(buttonRoot);
+    return true;
   }
   return false;
 }
 
 function updateUIBillboard() {
-  // Schild und Button 0.7 m vor die Kamera, Schild mittig, Button rechts daneben
+  if (!xrActive) return;
+  // Schild und Button ~0.7 m vor die Kamera
   const dist = 0.7;
   const offsetSign = new THREE.Vector3(-0.08, -0.12, -dist);
   const offsetButton = new THREE.Vector3(0.22, -0.12, -dist);
@@ -502,12 +475,12 @@ function updateUIBillboard() {
   signMesh.position.copy(camera.localToWorld(offsetSign.clone()));
   buttonRoot.position.copy(camera.localToWorld(offsetButton.clone()));
 
-  // Billboard: immer zur Kamera ausgerichtet
   signMesh.quaternion.copy(camera.quaternion);
   buttonRoot.quaternion.copy(camera.quaternion);
 }
 
 function updateUIHover(controller) {
+  if (!xrActive) return;
   const origin = new THREE.Vector3();
   const dir = new THREE.Vector3(0, 0, -1);
   controller.updateMatrixWorld(true);
@@ -525,23 +498,21 @@ function updateUIHover(controller) {
   }
 }
 
-// Schild (Canvas) erstellen
+// Schild (Canvas)
 function createBillboardSign(initialText) {
-  const w = 1024, h = 512; // 2:1
+  const w = 1024, h = 512;
   const canvas = document.createElement('canvas');
   canvas.width = w; canvas.height = h;
   const ctx = canvas.getContext('2d');
 
   function draw(text) {
     ctx.clearRect(0,0,w,h);
-    // Hintergrund mit Rand
     ctx.fillStyle = 'rgba(20,20,20,0.75)';
     roundRect(ctx, 20, 20, w-40, h-40, 28, true, false);
     ctx.strokeStyle = 'rgba(255,255,255,0.2)';
     ctx.lineWidth = 4;
     roundRect(ctx, 20, 20, w-40, h-40, 28, false, true);
 
-    // Text
     ctx.fillStyle = '#e8f6ff';
     ctx.font = 'bold 44px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
     const lines = text.split('\n');
@@ -553,15 +524,11 @@ function createBillboardSign(initialText) {
   }
 
   const texture = new THREE.CanvasTexture(canvas);
-  texture.needsUpdate = true;
-
   const mat = new THREE.MeshBasicMaterial({ map: texture, transparent: true });
   const geo = new THREE.PlaneGeometry(0.48, 0.24);
   const mesh = new THREE.Mesh(geo, mat);
 
   function setText(t) { draw(t); texture.needsUpdate = true; }
-
-  // initial
   draw(initialText);
 
   return { signMesh: mesh, setSignText: setText };
@@ -598,17 +565,15 @@ function roundRect(ctx, x, y, w, h, r, fill, stroke) {
   if (stroke) ctx.stroke();
 }
 
-// Button erstellen
+// Button
 function createClearBallsButton() {
   const root = new THREE.Group();
 
-  // Korpus (leicht transparent)
   const bodyGeo = new THREE.BoxGeometry(0.16, 0.06, 0.02);
   const bodyMat = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, metalness: 0, roughness: 1, transparent: true, opacity: 0.85 });
   const body = new THREE.Mesh(bodyGeo, bodyMat);
   root.add(body);
 
-  // Front mit Text (Plane + CanvasTexture)
   const w = 512, h = 256;
   const canvas = document.createElement('canvas');
   canvas.width = w; canvas.height = h;
@@ -627,20 +592,17 @@ function createClearBallsButton() {
   drawFront('idle');
 
   const tex = new THREE.CanvasTexture(canvas);
-  tex.needsUpdate = true;
   const frontMat = new THREE.MeshBasicMaterial({ map: tex });
   const frontGeo = new THREE.PlaneGeometry(0.145, 0.045);
   const front = new THREE.Mesh(frontGeo, frontMat);
-  front.position.z = 0.011; // leicht vor dem Korpus
+  front.position.z = 0.011;
   root.add(front);
 
   function setState(state) { drawFront(state); tex.needsUpdate = true; }
 
-  // Für Raycast nur die Front anklickbar
   return { buttonRoot: root, buttonFront: front, setButtonState: setState };
 }
 
-// Klick-Feedback (kleiner Push-In)
 function flashButton(root) {
   const start = performance.now();
   const dur = 120;
@@ -648,7 +610,7 @@ function flashButton(root) {
   function tick() {
     const t = performance.now() - start;
     const k = Math.min(1, t / dur);
-    root.position.z = base - 0.01 * Math.sin(k * Math.PI); // rein & raus
+    root.position.z = base - 0.01 * Math.sin(k * Math.PI);
     if (k < 1) requestAnimationFrame(tick);
     else root.position.z = base;
   }
@@ -666,6 +628,45 @@ function onWindowResize() {
 }
 
 // ==============================
+// Session Events
+// ==============================
+renderer.xr.addEventListener('sessionstart', async () => {
+  xrActive = true;
+  signMesh.visible = true;
+  buttonRoot.visible = true;
+
+  xrSession = renderer.xr.getSession();
+  refSpace = renderer.xr.getReferenceSpace();
+  try {
+    viewerSpace = await xrSession.requestReferenceSpace('viewer');
+    if (xrSession.requestHitTestSource) {
+      hitTestSource = await xrSession.requestHitTestSource({ space: viewerSpace });
+      setSignText("👀 Schaue auf den Boden und platziere das Reticle.\nDrücke den TRIGGER der LINKEN Hand, um die Bodenhöhe zu setzen.");
+    } else {
+      setSignText("ℹ️ Hit-Test nicht verfügbar – Boden bleibt bei y=0.\nLinker Trigger: Bälle • Rechter Trigger: Fläche • 🧹: Alle Bälle löschen");
+    }
+  } catch (e) {
+    console.warn('Hit-Test Setup fehlgeschlagen:', e);
+    setSignText("ℹ️ Hit-Test nicht verfügbar – Boden bleibt bei y=0.\nLinker Trigger: Bälle • Rechter Trigger: Fläche • 🧹: Alle Bälle löschen");
+  }
+});
+
+renderer.xr.addEventListener('sessionend', () => {
+  xrActive = false;
+  signMesh.visible = false;
+  buttonRoot.visible = false;
+  reticle.visible = false;
+
+  xrSession = null; viewerSpace = null; refSpace = null; hitTestSource = null;
+
+  // Meshes aufräumen
+  for (const [meshKey, rec] of meshMap) removeMeshRecord(meshKey, rec);
+  meshMap.clear();
+
+  showHint('ℹ️ AR-Session beendet');
+});
+
+// ==============================
 // Loop (Physik + Hit-Test + Mesh + UI)
 // ==============================
 const fixedTimeStep = 1 / 60;
@@ -681,13 +682,13 @@ renderer.setAnimationLoop((_, frame) => {
   }
 
   // XR Hit-Test (Reticle)
-  if (frame && hitTestSource && refSpace) {
+  if (xrActive && frame && hitTestSource && refSpace) {
     const results = frame.getHitTestResults(hitTestSource);
     if (results && results.length > 0) {
       const pose = results[0].getPose(refSpace);
       if (pose) {
         lastHitPose = pose;
-        reticle.visible = !floorLocked; // Reticle nur bis zum Setzen
+        reticle.visible = !floorLocked;
         reticle.position.set(pose.transform.position.x, pose.transform.position.y, pose.transform.position.z);
       }
     } else {
@@ -697,23 +698,25 @@ renderer.setAnimationLoop((_, frame) => {
   }
 
   // M7: Raum-Mesh verarbeiten
-  if (frame && typeof frame.detectedMeshes !== 'undefined' && refSpace) {
+  if (xrActive && frame && typeof frame.detectedMeshes !== 'undefined' && refSpace) {
     handleDetectedMeshes(frame);
   }
 
   // Three <-> Physik sync (nur Bälle)
   syncMeshesFromPhysics();
 
-  // UI positionieren (vor der Kamera) & Hover mit beiden Controllern
-  updateUIBillboard();
-  if (leftController)  updateUIHover(leftController);
-  if (rightController) updateUIHover(rightController);
+  // UI (nur in Session) positionieren & Hover prüfen
+  if (xrActive) {
+    updateUIBillboard();
+    if (leftController)  updateUIHover(leftController);
+    if (rightController) updateUIHover(rightController);
+  }
 
   renderer.render(scene, camera);
 });
 
 // ==============================
-// UI-Helfer (Screen-Hint unten links)
+// UI-Helfer (Hint unten links)
 function showHint(text) {
   let el = document.getElementById('hint');
   if (!el) {
