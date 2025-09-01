@@ -5,40 +5,36 @@ import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFa
 import * as CANNON from 'https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js';
 
 // ==============================
-// Konfiguration (optimiert)
+// Konfiguration (Performance)
 // ==============================
 const USE_SIMPLE_VIZ = false;
-
-// Sichtbare Debug-Meshes AUS (kein weißes Drahtgitter mehr)
 const ENABLE_MESH_DEBUG = false;
 
-// Raum-Mesh Limits/Filter
-const MAX_MESHES = 40;                 // max. aktive XR-Meshes
-const MAX_TRIANGLES_PER_MESH = 3000;   // Tri-Cap pro Mesh (Downsampling)
-const MAX_MESH_DISTANCE = 6.5;         // m – Distanz-Culling (mit Radius-Puffer)
+// --- Raum-Mesh Limits/Filter ---
+const MAX_MESHES = 40;                 // Max. aktive XR-Meshes
+const MAX_TRIANGLES_PER_MESH = 3000;   // Tri-Cap pro Mesh
+const MAX_MESH_DISTANCE = 6.0;         // m, darüber ignorieren/abbauen
 const DETECTED_MESH_UPDATE_RATE = 2;   // nur jeden 2. Frame verarbeiten
+const ACCEPT_SEMANTICS = ['floor', 'wall', 'table']; // Filter; setze null für alle
 
-// Optionaler Semantik-Filter (robust: nur anwenden, wenn Label vorhanden)
-const ACCEPT_SEMANTICS = ['floor','wall','ceiling','vertical','vertical_surface','table'];
-
-// Physik/Solver
+// --- Physik-/Solver-Feinschliff ---
 const FIXED_DT = 1 / 60;
-const SOLVER_ITER = 7;
-const SOLVER_TOL  = 0.001;
+const SOLVER_ITER = 7;                 // default 10 → leicht runter
+const SOLVER_TOL = 0.001;
 
-// Bälle
+// --- Bälle ---
 const BALL_RADIUS   = 0.02;
 const BALL_MASS     = 0.003;
 const BALL_SPEED    = 3.5;
 const BALL_LIMIT    = 200;
 const BALL_LIFETIME = 20 * 1000;
 const BALL_SPAWN_OFFSET = 0.22;
-const BALL_NO_COLLISION_MS = 60; // kürzer, damit nicht „durch“ fliegt
+const BALL_NO_COLLISION_MS = 120;
 
-// UI
-const RAYCAST_INTERVAL_MS = 33;        // ~30 Hz Hover
+// --- UI ---
+const RAYCAST_INTERVAL_MS = 33;        // ~30 Hz Hover-Update
 
-// Mesh-Kollisionen Toggle
+// --- Mesh-Kollisions-Toggle (UI-Button steuert das) ---
 let meshCollisionsEnabled = true;
 
 // ==============================
@@ -86,11 +82,12 @@ let xrSession = null, viewerSpace = null, refSpace = null, hitTestSource = null;
 let xrActive = false;
 
 // ==============================
-// Physik (CANNON) – schnell & stabil
+// Physik (CANNON) – Performance
 // ==============================
 const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
-world.broadphase = new CANNON.SAPBroadphase(world); // schnellere Broadphase
-world.allowSleep = true;                             // Schlafen erlauben
+// PERF: schnellere Broadphase & Sleep
+world.broadphase = new CANNON.SAPBroadphase(world);
+world.allowSleep = true;
 world.solver.iterations = SOLVER_ITER;
 world.solver.tolerance  = SOLVER_TOL;
 
@@ -98,9 +95,7 @@ const matBall  = new CANNON.Material('ball');
 const matWorld = new CANNON.Material('world');
 world.defaultContactMaterial.contactEquationStiffness = 1e7;
 world.defaultContactMaterial.contactEquationRelaxation = 3;
-world.addContactMaterial(new CANNON.ContactMaterial(matBall, matWorld, {
-  friction: 0.35, restitution: 0.6
-}));
+world.addContactMaterial(new CANNON.ContactMaterial(matBall, matWorld, { friction: 0.35, restitution: 0.6 }));
 
 // Boden-Plane
 const groundBody = new CANNON.Body({ mass: 0, material: matWorld });
@@ -133,22 +128,26 @@ let signMesh, setSignText;
 signMesh.visible = false;
 scene.add(signMesh);
 
-// Panel mit 2 Buttons
+// Panel
 const uiRoot = new THREE.Group();
-uiRoot.visible = false; // per Menütaste togglen
+uiRoot.visible = false;
 scene.add(uiRoot);
 
+// Button 1: Bälle löschen
 const { buttonRoot: clearBtnRoot, buttonFront: clearBtnFront, setButtonState: setClearBtnState } = createClearBallsButton();
 uiRoot.add(clearBtnRoot);
 
+// Button 2: Mesh-Kollisionen Toggle
 const { toggleRoot: meshBtnRoot, toggleFront: meshBtnFront, setToggleVisual } = createMeshToggleButton();
 uiRoot.add(meshBtnRoot);
 
+// nebeneinander
 clearBtnRoot.position.x = -0.09;
 meshBtnRoot.position.x  =  0.09;
 
 let interactive = [clearBtnFront, meshBtnFront];
 
+// Raycaster (throttled)
 const raycaster = new THREE.Raycaster();
 let hovered = null;
 let lastRayTs = 0;
@@ -247,7 +246,7 @@ function onSelectStart(evt) {
 }
 
 // ==============================
-// Bälle – shared Geo/Mat + Sleep
+// Bälle – Performance: Shared Geo/Mat + Sleep
 // ==============================
 const balls = []; // { mesh, body, bornAt }
 const BALL_GEO = new THREE.SphereGeometry(BALL_RADIUS, 16, 12);
@@ -275,12 +274,12 @@ function spawnBall(origin, dir) {
   body.velocity.set(dir.x * BALL_SPEED, dir.y * BALL_SPEED, dir.z * BALL_SPEED);
   body.angularVelocity.set((Math.random()-0.5)*5, (Math.random()-0.5)*5, (Math.random()-0.5)*5);
 
-  // Sleep
+  // Sleep-Setup
   body.allowSleep = true;
-  body.sleepSpeedLimit = 0.08;
-  body.sleepTimeLimit  = 0.8;
+  body.sleepSpeedLimit = 0.08; // < 8 cm/s
+  body.sleepTimeLimit  = 0.8;  // 0.8 s stabil → sleep
 
-  // kurze No-Collision-Phase
+  // Anlaufphase ohne Kollision
   body.collisionResponse = false;
   setTimeout(() => { body.collisionResponse = true; }, BALL_NO_COLLISION_MS);
 
@@ -293,12 +292,15 @@ function spawnBall(origin, dir) {
 
 function removeBall(item) {
   scene.remove(item.mesh);
+  // Geometrie/Material shared → NICHT dispose'n
   world.removeBody(item.body);
   const i = balls.indexOf(item);
   if (i !== -1) balls.splice(i, 1);
 }
 
-function clearAllBalls() { while (balls.length) removeBall(balls[0]); }
+function clearAllBalls() {
+  while (balls.length) removeBall(balls[0]);
+}
 
 function fireFromLeft() {
   if (!leftGrip) return;
@@ -320,8 +322,8 @@ function lockFloorAtReticle() {
   groundBody.position.y = y;
   grid.position.y = y;
 
-  reticle.visible = false;   // danach unsichtbar
-  signMesh.visible = false;  // Schild aus
+  reticle.visible = false;
+  signMesh.visible = false;
 
   setSignText("✅ Boden gesetzt.\nLinker Trigger: Bälle • Rechter Trigger: Fläche • Menü (links): UI-Panel");
   showHint(`✅ Boden gesetzt (y=${y.toFixed(2)} m).`);
@@ -329,7 +331,6 @@ function lockFloorAtReticle() {
 
 // ==============================
 // Manuelle Flächen (Box)
-// ==============================
 const colliders = [];
 const DEFAULT_W = 1.0, DEFAULT_H = 1.0, THICK = 0.02;
 
@@ -356,32 +357,14 @@ function addPlaneColliderAtHit(pose) {
 }
 
 // ==============================
-// Raum-Mesh → CANNON.Trimesh (performant + unsichtbar)
+// Raum-Mesh → CANNON.Trimesh (getunt)
 // ==============================
-const meshMap = new Map(); // XRMesh -> { body, debugMesh?, lastChangedTime, radius }
+const meshMap = new Map(); // XRMesh -> { body, debugMesh?, lastChangedTime }
 let meshFrameCounter = 0;
 const camPos = new THREE.Vector3();
 
-function estimateRadius(vertices) {
-  // einfache Bounding-Sphere-Schätzung um (0,0,0)
-  let maxR2 = 0;
-  for (let i = 0; i < vertices.length; i += 3) {
-    const x = vertices[i], y = vertices[i+1], z = vertices[i+2];
-    const r2 = x*x + y*y + z*z;
-    if (r2 > maxR2) maxR2 = r2;
-  }
-  return Math.sqrt(maxR2);
-}
-
-function semanticsAccepted(xrmesh) {
-  if (!Array.isArray(ACCEPT_SEMANTICS) || ACCEPT_SEMANTICS.length === 0) return true;
-  const lbl = (xrmesh.semanticLabel || '').toString().toLowerCase();
-  if (!lbl) return true; // kein Label → nicht rausfiltern
-  return ACCEPT_SEMANTICS.includes(lbl);
-}
-
 function handleDetectedMeshes(frame) {
-  // Throttle
+  // Throttle: nur jeden N-ten Frame
   meshFrameCounter = (meshFrameCounter + 1) % DETECTED_MESH_UPDATE_RATE;
   if (meshFrameCounter !== 0) return;
 
@@ -396,24 +379,26 @@ function handleDetectedMeshes(frame) {
   for (const xrmesh of detected) {
     if (count >= MAX_MESHES) break;
 
-    if (!semanticsAccepted(xrmesh)) continue;
+    // Semantik-Filter (falls verfügbar)
+    if (ACCEPT_SEMANTICS && xrmesh.semanticLabel && !ACCEPT_SEMANTICS.includes(xrmesh.semanticLabel)) {
+      continue;
+    }
 
     const pose = frame.getPose(xrmesh.meshSpace, refSpace);
     if (!pose) continue;
 
     const p = pose.transform.position;
-    const q = pose.transform.orientation;
+    const dist = Math.hypot(p.x - camPos.x, p.y - camPos.y, p.z - camPos.z);
+
+    // Distanz-Culling
+    if (dist > MAX_MESH_DISTANCE) {
+      const stale = meshMap.get(xrmesh);
+      if (stale) { removeMeshRecord(xrmesh, stale); meshMap.delete(xrmesh); }
+      continue;
+    }
 
     const rec = meshMap.get(xrmesh);
     const changed = !rec || (xrmesh.lastChangedTime > (rec.lastChangedTime ?? -1));
-
-    // Distanz-Culling mit Radius-Puffer
-    const dist = Math.hypot(p.x - camPos.x, p.y - camPos.y, p.z - camPos.z);
-    const radius = rec?.radius ?? estimateRadius(xrmesh.vertices);
-    if (dist - radius > MAX_MESH_DISTANCE) {
-      if (rec) { removeMeshRecord(xrmesh, rec); meshMap.delete(xrmesh); }
-      continue;
-    }
 
     if (!rec) {
       const shape = createTrimeshShapeCapped(xrmesh.vertices, xrmesh.indices);
@@ -422,8 +407,12 @@ function handleDetectedMeshes(frame) {
       const body = new CANNON.Body({ mass: 0, material: matWorld });
       body.addShape(shape);
       body.position.set(p.x, p.y, p.z);
+      const q = pose.transform.orientation;
       body.quaternion.set(q.x, q.y, q.z, q.w);
-      body.collisionResponse = meshCollisionsEnabled; // Schalter respektieren
+
+      // respektiere Mesh-Kollisions-Schalter
+      body.collisionResponse = meshCollisionsEnabled;
+
       world.addBody(body);
 
       let debugMesh = null;
@@ -438,9 +427,10 @@ function handleDetectedMeshes(frame) {
         scene.add(debugMesh);
       }
 
-      meshMap.set(xrmesh, { body, debugMesh, lastChangedTime: xrmesh.lastChangedTime, radius });
+      meshMap.set(xrmesh, { body, debugMesh, lastChangedTime: xrmesh.lastChangedTime });
     } else {
       // Pose-Update
+      const q = pose.transform.orientation;
       rec.body.position.set(p.x, p.y, p.z);
       rec.body.quaternion.set(q.x, q.y, q.z, q.w);
       if (rec.debugMesh) {
@@ -448,6 +438,7 @@ function handleDetectedMeshes(frame) {
         rec.debugMesh.quaternion.set(q.x, q.y, q.z, q.w);
       }
 
+      // Geometrie nur aktualisieren, wenn sich etwas geändert hat
       if (changed) {
         world.removeBody(rec.body);
         const shape = createTrimeshShapeCapped(xrmesh.vertices, xrmesh.indices);
@@ -459,9 +450,6 @@ function handleDetectedMeshes(frame) {
           newBody.collisionResponse = meshCollisionsEnabled;
           world.addBody(newBody);
           rec.body = newBody;
-
-          // Radius ggf. neu schätzen
-          rec.radius = estimateRadius(xrmesh.vertices);
 
           if (rec.debugMesh) {
             scene.remove(rec.debugMesh);
@@ -483,7 +471,7 @@ function handleDetectedMeshes(frame) {
     count++;
   }
 
-  // Entfernen nicht gesehener Meshes
+  // Entfernen nicht gesehener (oder zu weiter) Meshes
   for (const [meshKey, rec] of meshMap) {
     if (!seen.has(meshKey)) {
       removeMeshRecord(meshKey, rec);
@@ -497,7 +485,7 @@ function createTrimeshShapeCapped(verticesTyped, indicesTyped) {
   const triCount = (indicesTyped.length / 3) | 0;
   if (triCount === 0) return null;
 
-  // Downsample per stride
+  // Cap / Downsample
   let indices;
   if (triCount > MAX_TRIANGLES_PER_MESH) {
     const stride = Math.ceil(triCount / MAX_TRIANGLES_PER_MESH);
@@ -599,151 +587,7 @@ function updateUIHoverThrottled(controller) {
   }
 }
 
-// ==============================
-// Session Events
-// ==============================
-renderer.xr.addEventListener('sessionstart', async () => {
-  xrActive = true;
-
-  signMesh.visible = true;
-  uiRoot.visible = false;
-
-  xrSession = renderer.xr.getSession();
-  refSpace = renderer.xr.getReferenceSpace();
-  try {
-    viewerSpace = await xrSession.requestReferenceSpace('viewer');
-    if (xrSession.requestHitTestSource) {
-      hitTestSource = await xrSession.requestHitTestSource({ space: viewerSpace });
-      setSignText("👀 Schaue auf den Boden und platziere das Reticle.\nDrücke den TRIGGER der LINKEN Hand, um die Bodenhöhe zu setzen.");
-    } else {
-      setSignText("ℹ️ Hit-Test nicht verfügbar – Boden bleibt bei y=0.\nMenü (links): UI ein/aus • 🧹 Bälle löschen • 🧱 Mesh-Kollisionen");
-    }
-  } catch (e) {
-    console.warn('Hit-Test Setup fehlgeschlagen:', e);
-    setSignText("ℹ️ Hit-Test nicht verfügbar – Boden bleibt bei y=0.\nMenü (links): UI ein/aus • 🧹 Bälle löschen • 🧱 Mesh-Kollisionen");
-  }
-});
-
-renderer.xr.addEventListener('sessionend', () => {
-  xrActive = false;
-  signMesh.visible = false;
-  uiRoot.visible = false;
-  reticle.visible = false;
-
-  xrSession = null; viewerSpace = null; refSpace = null; hitTestSource = null;
-
-  for (const [meshKey, rec] of meshMap) removeMeshRecord(meshKey, rec);
-  meshMap.clear();
-
-  showHint('ℹ️ AR-Session beendet');
-});
-
-// ==============================
-// Loop
-// ==============================
-renderer.setAnimationLoop((_, frame) => {
-  // Physik
-  world.step(FIXED_DT);
-
-  // Bälle-Despawn
-  const now = performance.now();
-  for (let i = balls.length - 1; i >= 0; i--) {
-    if (now - balls[i].bornAt > BALL_LIFETIME) removeBall(balls[i]);
-  }
-
-  // XR Hit-Test
-  if (xrActive && frame && hitTestSource && refSpace) {
-    const results = frame.getHitTestResults(hitTestSource);
-    if (results && results.length > 0) {
-      const pose = results[0].getPose(refSpace);
-      if (pose) {
-        lastHitPose = pose;
-        reticle.visible = !floorLocked;
-        if (!floorLocked) {
-          reticle.position.set(pose.transform.position.x, pose.transform.position.y, pose.transform.position.z);
-        }
-      }
-    } else {
-      lastHitPose = null;
-      reticle.visible = false;
-    }
-  }
-
-  // Raum-Meshes (performant)
-  if (xrActive && frame && typeof frame.detectedMeshes !== 'undefined' && refSpace) {
-    handleDetectedMeshes(frame);
-  }
-
-  // Three <-> Physik sync (nur Bälle)
-  syncMeshesFromPhysics();
-
-  // UI
-  if (xrActive) {
-    updateUIBillboard();
-    if (uiRoot.visible) {
-      updateUIHoverThrottled(controller0);
-      updateUIHoverThrottled(controller1);
-    }
-    pollMenuToggle();
-  }
-
-  renderer.render(scene, camera);
-});
-
-// ==============================
-// Menütaste / Fallback → UI-Panel togglen
-// ==============================
-function pollMenuToggle() {
-  const left = leftController;
-  if (!left) return;
-  const gp = left.userData.gamepad;
-  let pressed = false;
-
-  if (gp && gp.buttons && gp.buttons.length) {
-    const candidates = [4,3,2]; // X/Menu/Y/Stick (robust)
-    for (const idx of candidates) {
-      if (gp.buttons[idx] && gp.buttons[idx].pressed) { pressed = true; break; }
-    }
-  }
-  if (pressed && !menuPrev) uiRoot.visible = !uiRoot.visible;
-  menuPrev = pressed;
-
-  // Fallback: Longpress auf Left-SQUEEZE (>=1s)
-  if (gp && gp.buttons && gp.buttons[1]) {
-    if (gp.buttons[1].pressed) {
-      squeezeTimer += FIXED_DT;
-      if (squeezeTimer >= 1.0) { uiRoot.visible = !uiRoot.visible; squeezeTimer = 0; }
-    } else squeezeTimer = 0;
-  }
-}
-
-// ==============================
-// UI-Helfer (Hint unten links)
-// ==============================
-function showHint(text) {
-  let el = document.getElementById('hint');
-  if (!el) {
-    el = document.createElement('div');
-    el.id = 'hint';
-    el.style.position = 'fixed';
-    el.style.left = '12px';
-    el.style.bottom = '12px';
-    el.style.zIndex = '9999';
-    el.style.padding = '8px 10px';
-    el.style.fontFamily = 'system-ui, sans-serif';
-    el.style.fontSize = '12px';
-    el.style.background = 'rgba(0,0,0,0.6)';
-    el.style.color = '#eee';
-    el.style.borderRadius = '8px';
-    el.style.maxWidth = '80vw';
-    document.body.appendChild(el);
-  }
-  el.textContent = text;
-}
-
-// ==============================
-// UI-Bausteine (Schild + Buttons)
-// ==============================
+// Schild (Canvas)
 function createBillboardSign(initialText) {
   const w = 1024, h = 512;
   const canvas = document.createElement('canvas');
@@ -810,6 +654,7 @@ function roundRect(ctx, x, y, w, h, r, fill, stroke) {
   if (stroke) ctx.stroke();
 }
 
+// Button: Bälle löschen
 function createClearBallsButton() {
   const root = new THREE.Group();
 
@@ -847,6 +692,7 @@ function createClearBallsButton() {
   return { buttonRoot: root, buttonFront: front, setButtonState: setState };
 }
 
+// Toggle-Button: Mesh-Kollisionen
 function createMeshToggleButton() {
   const root = new THREE.Group();
 
@@ -886,6 +732,7 @@ function createMeshToggleButton() {
   return { toggleRoot: root, toggleFront: front, setToggleVisual: setVisual };
 }
 
+// Button-Feedback
 function flashButton(root) {
   const start = performance.now();
   const dur = 120;
@@ -902,7 +749,149 @@ function flashButton(root) {
 
 function toggleMeshCollisions() {
   meshCollisionsEnabled = !meshCollisionsEnabled;
-  for (const [, rec] of meshMap) rec.body.collisionResponse = meshCollisionsEnabled;
+  for (const [, rec] of meshMap) {
+    rec.body.collisionResponse = meshCollisionsEnabled;
+  }
   setToggleVisual('idle', meshCollisionsEnabled);
   showHint(meshCollisionsEnabled ? '🧱 Mesh-Kollisionen: AN' : '🧱 Mesh-Kollisionen: AUS');
+}
+
+// ==============================
+// Session Events
+// ==============================
+renderer.xr.addEventListener('sessionstart', async () => {
+  xrActive = true;
+
+  signMesh.visible = true;
+  uiRoot.visible = false;
+
+  xrSession = renderer.xr.getSession();
+  refSpace = renderer.xr.getReferenceSpace();
+  try {
+    viewerSpace = await xrSession.requestReferenceSpace('viewer');
+    if (xrSession.requestHitTestSource) {
+      hitTestSource = await xrSession.requestHitTestSource({ space: viewerSpace });
+      setSignText("👀 Schaue auf den Boden und platziere das Reticle.\nDrücke den TRIGGER der LINKEN Hand, um die Bodenhöhe zu setzen.");
+    } else {
+      setSignText("ℹ️ Hit-Test nicht verfügbar – Boden bleibt bei y=0.\nMenü (links): UI ein/aus • 🧹 Bälle löschen • 🧱 Mesh-Kollisionen");
+    }
+  } catch (e) {
+    console.warn('Hit-Test Setup fehlgeschlagen:', e);
+    setSignText("ℹ️ Hit-Test nicht verfügbar – Boden bleibt bei y=0.\nMenü (links): UI ein/aus • 🧹 Bälle löschen • 🧱 Mesh-Kollisionen");
+  }
+});
+
+renderer.xr.addEventListener('sessionend', () => {
+  xrActive = false;
+  signMesh.visible = false;
+  uiRoot.visible = false;
+  reticle.visible = false;
+
+  xrSession = null; viewerSpace = null; refSpace = null; hitTestSource = null;
+
+  for (const [meshKey, rec] of meshMap) removeMeshRecord(meshKey, rec);
+  meshMap.clear();
+
+  showHint('ℹ️ AR-Session beendet');
+});
+
+// ==============================
+// Loop (Physik + Hit-Test + Mesh + UI + Gamepad-Poll)
+// ==============================
+renderer.setAnimationLoop((_, frame) => {
+  // Physik
+  world.step(FIXED_DT);
+
+  // Bälle-Despawn
+  const now = performance.now();
+  for (let i = balls.length - 1; i >= 0; i--) {
+    if (now - balls[i].bornAt > BALL_LIFETIME) removeBall(balls[i]);
+  }
+
+  // XR Hit-Test
+  if (xrActive && frame && hitTestSource && refSpace) {
+    const results = frame.getHitTestResults(hitTestSource);
+    if (results && results.length > 0) {
+      const pose = results[0].getPose(refSpace);
+      if (pose) {
+        lastHitPose = pose;
+        reticle.visible = !floorLocked;
+        if (!floorLocked) {
+          reticle.position.set(pose.transform.position.x, pose.transform.position.y, pose.transform.position.z);
+        }
+      }
+    } else {
+      lastHitPose = null;
+      reticle.visible = false;
+    }
+  }
+
+  // Raum-Mesh (getunt verarbeitet)
+  if (xrActive && frame && typeof frame.detectedMeshes !== 'undefined' && refSpace) {
+    handleDetectedMeshes(frame);
+  }
+
+  // Three <-> Physik sync (nur Bälle)
+  syncMeshesFromPhysics();
+
+  // UI positionieren & Hover (throttled)
+  if (xrActive) {
+    updateUIBillboard();
+    if (uiRoot.visible) {
+      updateUIHoverThrottled(controller0);
+      updateUIHoverThrottled(controller1);
+    }
+    pollMenuToggle();
+  }
+
+  renderer.render(scene, camera);
+});
+
+// ==============================
+// Menütaste / Fallback-Longpress → UI-Panel togglen
+// ==============================
+function pollMenuToggle() {
+  const left = leftController;
+  if (!left) return;
+  const gp = left.userData.gamepad;
+  let pressed = false;
+
+  if (gp && gp.buttons && gp.buttons.length) {
+    const candidates = [4,3,2]; // X/Menu/Y/Stick (robust)
+    for (const idx of candidates) {
+      if (gp.buttons[idx] && gp.buttons[idx].pressed) { pressed = true; break; }
+    }
+  }
+  if (pressed && !menuPrev) uiRoot.visible = !uiRoot.visible;
+  menuPrev = pressed;
+
+  if (gp && gp.buttons && gp.buttons[1]) {
+    if (gp.buttons[1].pressed) {
+      squeezeTimer += FIXED_DT;
+      if (squeezeTimer >= 1.0) { uiRoot.visible = !uiRoot.visible; squeezeTimer = 0; }
+    } else squeezeTimer = 0;
+  }
+}
+
+// ==============================
+// UI-Helfer (Hint unten links)
+function showHint(text) {
+  let el = document.getElementById('hint');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'hint';
+    el.style.position = 'fixed';
+    el.style.left = '12px';
+    el.style.bottom = '12px';
+    el.style.zIndex = '9999';
+    el.style.padding = '8px 10px';
+    el.style.fontFamily = 'system-ui, sans-serif';
+    el.style.fontSize = '12px';
+    el.style.background = 'rgba(0,0,0,0.6)';
+    el.style.color = '#eee';
+    el.style.borderRadius = '8px';
+    el.style.maxWidth = '80vw';
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
 }
