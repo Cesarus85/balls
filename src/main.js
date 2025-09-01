@@ -243,6 +243,7 @@ const BALL_LIFETIME = 20 * 1000;
 
 const sharedBallGeometry = new THREE.SphereGeometry(BALL_RADIUS, 16, 12);
 const sharedBallMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.8, metalness: 0.0 });
+const sharedBallShape = new CANNON.Sphere(BALL_RADIUS);
 
 function syncMeshesFromPhysics() {
   for (let i = 0; i < balls.length; i++) {
@@ -257,9 +258,8 @@ function spawnBall(origin, dir) {
   const mesh = new THREE.Mesh(sharedBallGeometry, sharedBallMaterial);
   scene.add(mesh);
 
-  const shape = new CANNON.Sphere(BALL_RADIUS);
   const body = new CANNON.Body({ mass: BALL_MASS, material: matBall });
-  body.addShape(shape);
+  body.addShape(sharedBallShape);
 
   body.position.set(origin.x, origin.y, origin.z);
   body.velocity.set(dir.x * BALL_SPEED, dir.y * BALL_SPEED, dir.z * BALL_SPEED);
