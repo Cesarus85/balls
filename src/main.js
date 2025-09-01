@@ -284,7 +284,7 @@ function lockFloorAtReticle() {
   const y = reticle.position.y;
   groundBody.position.y = y;
   grid.position.y = y;
-  setSignText("✅ Boden gesetzt.\nLinker Trigger: Bälle feuern\nRechter Trigger: Fläche platzieren\n🧹 Button: Alle Bälle löschen");
+  setSignText("✅ Boden gesetzt.\nLinker Trigger: Bälle feuern\nRechter Trigger: Fläche platzieren (auf Reticle zielen)\n🧹 Button: Alle Bälle löschen");
   showHint(`✅ Boden gesetzt (y=${y.toFixed(2)} m).`);
 }
 
