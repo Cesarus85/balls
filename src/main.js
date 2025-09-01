@@ -8,14 +8,14 @@ import * as CANNON from 'https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cann
 // Konfiguration (Performance)
 // ==============================
 const USE_SIMPLE_VIZ = false;
-const ENABLE_MESH_DEBUG = false;
+const ENABLE_MESH_DEBUG = true;
 
 // --- Raum-Mesh Limits/Filter ---
 const MAX_MESHES = 40;                 // Max. aktive XR-Meshes
 const MAX_TRIANGLES_PER_MESH = 3000;   // Tri-Cap pro Mesh
-const MAX_MESH_DISTANCE = 6.0;         // m, darüber ignorieren/abbauen
+const MAX_MESH_DISTANCE = Infinity;         // m, darüber ignorieren/abbauen
 const DETECTED_MESH_UPDATE_RATE = 2;   // nur jeden 2. Frame verarbeiten
-const ACCEPT_SEMANTICS = ['floor', 'wall', 'table']; // Filter; setze null für alle
+const ACCEPT_SEMANTICS = null; // Filter; setze null für alle
 
 // --- Physik-/Solver-Feinschliff ---
 const FIXED_DT = 1 / 60;
