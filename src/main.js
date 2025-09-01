@@ -241,6 +241,9 @@ const BALL_SPEED    = 3.5;
 const BALL_LIMIT    = 200;
 const BALL_LIFETIME = 20 * 1000;
 
+const sharedBallGeometry = new THREE.SphereGeometry(BALL_RADIUS, 16, 12);
+const sharedBallMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.8, metalness: 0.0 });
+
 function syncMeshesFromPhysics() {
   for (let i = 0; i < balls.length; i++) {
     const { mesh, body } = balls[i];
@@ -251,10 +254,7 @@ function syncMeshesFromPhysics() {
 
 function spawnBall(origin, dir) {
   if (balls.length >= BALL_LIMIT) removeBall(balls[0]);
-
-  const sphereGeo = new THREE.SphereGeometry(BALL_RADIUS, 16, 12);
-  const sphereMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.8, metalness: 0.0 });
-  const mesh = new THREE.Mesh(sphereGeo, sphereMat);
+  const mesh = new THREE.Mesh(sharedBallGeometry, sharedBallMaterial);
   scene.add(mesh);
 
   const shape = new CANNON.Sphere(BALL_RADIUS);
@@ -278,8 +278,6 @@ function spawnBall(origin, dir) {
 
 function removeBall(item) {
   scene.remove(item.mesh);
-  item.mesh.geometry.dispose();
-  item.mesh.material.dispose();
   world.removeBody(item.body);
   const i = balls.indexOf(item);
   if (i !== -1) balls.splice(i, 1);
@@ -872,3 +870,8 @@ function showHint(text) {
   }
   el.textContent = text;
 }
+
+window.addEventListener('beforeunload', () => {
+  sharedBallGeometry.dispose();
+  sharedBallMaterial.dispose();
+});
