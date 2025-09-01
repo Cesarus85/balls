@@ -13,9 +13,11 @@ const MAX_MESHES = 40;
 const MAX_TRIANGLES_PER_MESH = 3000;
 const ACCEPT_SEMANTICS = null;
 
-// Ball-Start-Konfiguration gegen „Abprallen direkt vor mir“
 const BALL_SPAWN_OFFSET = 0.22;   // 22 cm vor der linken Hand
-const BALL_NO_COLLISION_MS = 120; // so lange zunächst keine Kollision
+const BALL_NO_COLLISION_MS = 120; // Anlaufphase ohne Kollision, um Phantom-Bounces zu vermeiden
+
+// Mesh-Kollisions-Flag (per Button umschaltbar)
+let meshCollisionsEnabled = true;
 
 // ==============================
 // Renderer / Scene / Camera
@@ -36,7 +38,7 @@ const dir = new THREE.DirectionalLight(0xffffff, 0.6);
 dir.position.set(1, 2, 1);
 scene.add(dir);
 
-// Debug-Grid (auf Bodenhöhe verschoben)
+// Debug-Grid
 const grid = new THREE.GridHelper(4, 8, 0x888888, 0x444444);
 grid.material.opacity = 0.25;
 grid.material.transparent = true;
@@ -71,7 +73,7 @@ world.defaultContactMaterial.contactEquationStiffness = 1e7;
 world.defaultContactMaterial.contactEquationRelaxation = 3;
 world.addContactMaterial(new CANNON.ContactMaterial(matBall, matWorld, { friction: 0.35, restitution: 0.6 }));
 
-// Boden-Plane (zunächst y=0; später via Reticle gesetzt)
+// Boden-Plane
 const groundBody = new CANNON.Body({ mass: 0, material: matWorld });
 groundBody.addShape(new CANNON.Plane());
 groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0); // normal +Y
@@ -93,25 +95,36 @@ let floorLocked = false;
 let lastHitPose = null;
 
 // ==============================
-// UI: Schild + Button (sichtbar nur in XR)
+// UI: Schild + Panel (2 Buttons) – sichtbar nur in XR
 // ==============================
 let signMesh, setSignText;
-let buttonRoot, buttonFront, setButtonState;
-let interactive = []; // Raycast-Ziele
-
 ({ signMesh, setSignText } = createBillboardSign(
   "👀 Schaue auf den Boden und platziere das Reticle.\nDrücke den TRIGGER der LINKEN Hand, um die Bodenhöhe zu setzen."
 ));
 signMesh.visible = false;
 scene.add(signMesh);
 
-({ buttonRoot, buttonFront, setButtonState } = createClearBallsButton());
-buttonRoot.visible = false;
-scene.add(buttonRoot);
+// Panel mit zwei Buttons (🧹 & 🧱)
+const uiRoot = new THREE.Group(); // gemeinsam ein-/ausblendbar
+uiRoot.visible = false;           // per Menütaste togglen
+scene.add(uiRoot);
 
-interactive = [buttonFront];
+// --- Button 1: Bälle löschen
+const { buttonRoot: clearBtnRoot, buttonFront: clearBtnFront, setButtonState: setClearBtnState } = createClearBallsButton();
+uiRoot.add(clearBtnRoot);
 
-// Raycaster (für Button)
+// --- Button 2: Mesh-Kollisionen an/aus
+const { toggleRoot: meshBtnRoot, toggleFront: meshBtnFront, setToggleVisual } = createMeshToggleButton();
+uiRoot.add(meshBtnRoot);
+
+// Buttons nebeneinander anordnen
+clearBtnRoot.position.x = -0.09;
+meshBtnRoot.position.x  =  0.09;
+
+// Interaktive Ziele (Raycast)
+let interactive = [clearBtnFront, meshBtnFront];
+
+// Raycaster (für Buttons)
 const raycaster = new THREE.Raycaster();
 let hovered = null;
 
@@ -125,7 +138,7 @@ scene.add(controller0, controller1);
 const controllerGrip0 = renderer.xr.getControllerGrip(0);
 const controllerGrip1 = renderer.xr.getControllerGrip(1);
 
-// Hilfsfunktionen (vor Nutzung)
+// Hilfsfunktionen (vor Nutzung definiert)
 function addSimpleControllerViz(grip){
   const geo = new THREE.ConeGeometry(0.01, 0.08, 16);
   const mat = new THREE.MeshStandardMaterial({ color: 0x8888ff, metalness: 0, roughness: 0.9 });
@@ -169,9 +182,8 @@ let leftController = null, rightController = null;
 let leftGrip = null, rightGrip = null;
 
 // Gamepad-State für Menü/Toggle
-let leftGamepad = null;
 let menuPrev = false;
-let squeezeTimer = 0; // für Longpress-Fallback
+let squeezeTimer = 0; // Fallback-Longpress
 
 function onConnected(event) {
   const src = event.data;
@@ -181,7 +193,6 @@ function onConnected(event) {
   if (src.handedness === 'left') {
     leftController = this;
     leftGrip = (this === controller0) ? controllerGrip0 : controllerGrip1;
-    leftGamepad = src.gamepad || null;
     addLeftGunBlock(leftGrip);
   } else if (src.handedness === 'right') {
     rightController = this;
@@ -201,7 +212,7 @@ function onSelectStart(evt) {
   if (!xrActive) return;
   const target = evt.target;
 
-  // 1) Button per Raycast?
+  // 1) Buttons per Raycast?
   if (tryPressUIButton(target)) return;
 
   // 2) Boden setzen (nur linker Trigger, solange Reticle sichtbar)
@@ -209,7 +220,7 @@ function onSelectStart(evt) {
     lockFloorAtReticle();
     return;
   }
-  // 3) Rechte Hand: Fläche platzieren (Reticle ist unsichtbar, lastHitPose wird aber weiter aktualisiert)
+  // 3) Rechte Hand: Fläche platzieren (auch wenn Reticle unsichtbar ist; lastHitPose wird fortgeführt)
   if (target === rightController && lastHitPose) {
     addPlaneColliderAtHit(lastHitPose);
     return;
@@ -250,12 +261,11 @@ function spawnBall(origin, dir) {
   const body = new CANNON.Body({ mass: BALL_MASS, material: matBall });
   body.addShape(shape);
 
-  // Startposition + Richtung
   body.position.set(origin.x, origin.y, origin.z);
   body.velocity.set(dir.x * BALL_SPEED, dir.y * BALL_SPEED, dir.z * BALL_SPEED);
   body.angularVelocity.set((Math.random()-0.5)*5, (Math.random()-0.5)*5, (Math.random()-0.5)*5);
 
-  // Kurzzeitig keine Kollisionen zulassen, um „Abprallen direkt vor mir“ zu vermeiden
+  // No-collision Anlaufphase
   body.collisionResponse = false;
   setTimeout(() => { body.collisionResponse = true; }, BALL_NO_COLLISION_MS);
 
@@ -279,7 +289,6 @@ function clearAllBalls() {
   while (balls.length) removeBall(balls[0]);
 }
 
-// Schuss aus linker Hand
 function fireFromLeft() {
   if (!leftGrip) return;
   leftGrip.updateMatrixWorld(true);
@@ -287,7 +296,6 @@ function fireFromLeft() {
   const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(
     new THREE.Quaternion().setFromRotationMatrix(leftGrip.matrixWorld)
   ).normalize();
-  // weiter vom Körper entfernt starten
   const spawnPos = origin.clone().addScaledVector(dir, BALL_SPAWN_OFFSET);
   spawnBall(spawnPos, dir);
 }
@@ -300,11 +308,11 @@ function lockFloorAtReticle() {
   groundBody.position.y = y;
   grid.position.y = y;
 
-  // Reticle & Schild ausblenden, Button bleibt
+  // Reticle & Schild ausblenden (Button-Panel bleibt per Menütaste steuerbar)
   reticle.visible = false;
   signMesh.visible = false;
 
-  setSignText("✅ Boden gesetzt.\nLinker Trigger: Bälle feuern • Rechter Trigger: Fläche platzieren • 🧹: Alle Bälle löschen");
+  setSignText("✅ Boden gesetzt.\nLinker Trigger: Bälle • Rechter Trigger: Fläche • 🧹/🧱-Panel: Menütaste (links)");
   showHint(`✅ Boden gesetzt (y=${y.toFixed(2)} m).`);
 }
 
@@ -363,10 +371,16 @@ function handleDetectedMeshes(frame) {
 
       const body = new CANNON.Body({ mass: 0, material: matWorld });
       body.addShape(shape);
+
+      // Pose
       const p = pose.transform.position;
       const q = pose.transform.orientation;
       body.position.set(p.x, p.y, p.z);
       body.quaternion.set(q.x, q.y, q.z, q.w);
+
+      // SOFORT den globalen Schalter respektieren:
+      body.collisionResponse = meshCollisionsEnabled;
+
       world.addBody(body);
 
       let debugMesh = null;
@@ -399,6 +413,8 @@ function handleDetectedMeshes(frame) {
           newBody.addShape(shape);
           newBody.position.set(p.x, p.y, p.z);
           newBody.quaternion.set(q.x, q.y, q.z, q.w);
+          // respektiere aktuellen Schalter
+          newBody.collisionResponse = meshCollisionsEnabled;
           world.addBody(newBody);
           rec.body = newBody;
 
@@ -462,10 +478,11 @@ function removeMeshRecord(meshKey, rec) {
 }
 
 // ==============================
-// UI-Objekte / Interaktion
+// UI-Interaktion (Buttons per Raycast)
 // ==============================
 function tryPressUIButton(controller) {
-  if (!xrActive) return false;
+  if (!xrActive || !uiRoot.visible) return false;
+
   const origin = new THREE.Vector3();
   const dir = new THREE.Vector3(0, 0, -1);
   controller.updateMatrixWorld(true);
@@ -475,30 +492,43 @@ function tryPressUIButton(controller) {
   raycaster.set(origin, dir);
   raycaster.far = 3.0;
   const hits = raycaster.intersectObjects(interactive, false);
-  if (hits.length > 0 && hits[0].object === buttonFront) {
+  if (hits.length === 0) return false;
+
+  const obj = hits[0].object;
+  if (obj === clearBtnFront) {
     clearAllBalls();
-    setSignText("🧹 Alle Bälle gelöscht.\nLinker Trigger: Bälle • Rechter Trigger: Fläche • Reticle (nur vor Bodensetzen sichtbar).");
-    flashButton(buttonRoot);
+    setSignText("🧹 Alle Bälle gelöscht.\nMenü (links): UI ein/aus • 🧱 Mesh-Kollisionen umschalten");
+    flashButton(clearBtnRoot);
+    return true;
+  }
+  if (obj === meshBtnFront) {
+    toggleMeshCollisions();
+    flashButton(meshBtnRoot);
     return true;
   }
   return false;
 }
 
 function updateUIBillboard() {
-  if (!xrActive) return;
+  if (!xrActive || !uiRoot.visible) return;
+
+  // Schild ~0.7 m vor der Kamera (wenn sichtbar)
   const dist = 0.7;
   const offsetSign = new THREE.Vector3(-0.08, -0.12, -dist);
-  const offsetButton = new THREE.Vector3(0.22, -0.12, -dist);
+  const offsetPanel = new THREE.Vector3(0.02, -0.12, -dist);
 
-  signMesh.position.copy(camera.localToWorld(offsetSign.clone()));
-  buttonRoot.position.copy(camera.localToWorld(offsetButton.clone()));
+  if (signMesh.visible) {
+    signMesh.position.copy(camera.localToWorld(offsetSign.clone()));
+    signMesh.quaternion.copy(camera.quaternion);
+  }
 
-  signMesh.quaternion.copy(camera.quaternion);
-  buttonRoot.quaternion.copy(camera.quaternion);
+  uiRoot.position.copy(camera.localToWorld(offsetPanel.clone()));
+  uiRoot.quaternion.copy(camera.quaternion);
 }
 
 function updateUIHover(controller) {
-  if (!xrActive) return;
+  if (!xrActive || !uiRoot.visible) return;
+
   const origin = new THREE.Vector3();
   const dir = new THREE.Vector3(0, 0, -1);
   controller.updateMatrixWorld(true);
@@ -512,7 +542,8 @@ function updateUIHover(controller) {
 
   if (hovered !== nowHover) {
     hovered = nowHover;
-    setButtonState(hovered === buttonFront ? 'hover' : 'idle');
+    setClearBtnState(hovered === clearBtnFront ? 'hover' : 'idle');
+    setToggleVisual(hovered === meshBtnFront ? 'hover' : 'idle', meshCollisionsEnabled);
   }
 }
 
@@ -583,7 +614,7 @@ function roundRect(ctx, x, y, w, h, r, fill, stroke) {
   if (stroke) ctx.stroke();
 }
 
-// Button
+// Button: Bälle löschen
 function createClearBallsButton() {
   const root = new THREE.Group();
 
@@ -621,6 +652,47 @@ function createClearBallsButton() {
   return { buttonRoot: root, buttonFront: front, setButtonState: setState };
 }
 
+// Toggle-Button: Mesh-Kollisionen
+function createMeshToggleButton() {
+  const root = new THREE.Group();
+
+  const bodyGeo = new THREE.BoxGeometry(0.16, 0.06, 0.02);
+  const bodyMat = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, metalness: 0, roughness: 1, transparent: true, opacity: 0.85 });
+  const body = new THREE.Mesh(bodyGeo, bodyMat);
+  root.add(body);
+
+  const w = 512, h = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+
+  function drawFront(state='idle', enabled=true) {
+    ctx.clearRect(0,0,w,h);
+    const bgOn  = (state === 'hover') ? '#8af' : '#69f';
+    const bgOff = (state === 'hover') ? '#f88' : '#f55';
+    ctx.fillStyle = enabled ? bgOn : bgOff;
+    ctx.fillRect(0,0,w,h);
+    ctx.fillStyle = enabled ? '#0b1333' : '#3a0b0b';
+    ctx.font = 'bold 44px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+    const label = enabled ? '🧱  Mesh-Kollisionen: AN' : '🧱  Mesh-Kollisionen: AUS';
+    const tw = ctx.measureText(label).width;
+    ctx.fillText(label, (w - tw)/2, h/2 + 16);
+  }
+  drawFront('idle', meshCollisionsEnabled);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  const frontMat = new THREE.MeshBasicMaterial({ map: tex });
+  const frontGeo = new THREE.PlaneGeometry(0.145, 0.045);
+  const front = new THREE.Mesh(frontGeo, frontMat);
+  front.position.z = 0.011;
+  root.add(front);
+
+  function setVisual(state, enabled) { drawFront(state, enabled); tex.needsUpdate = true; }
+
+  return { toggleRoot: root, toggleFront: front, setToggleVisual: setVisual };
+}
+
+// Button-Feedback
 function flashButton(root) {
   const start = performance.now();
   const dur = 120;
@@ -635,13 +707,25 @@ function flashButton(root) {
   tick();
 }
 
+// Umschalten der Mesh-Kollisionen (Physikreaktion)
+function toggleMeshCollisions() {
+  meshCollisionsEnabled = !meshCollisionsEnabled;
+  for (const [, rec] of meshMap) {
+    rec.body.collisionResponse = meshCollisionsEnabled;
+  }
+  setToggleVisual('idle', meshCollisionsEnabled);
+  showHint(meshCollisionsEnabled ? '🧱 Mesh-Kollisionen: AN' : '🧱 Mesh-Kollisionen: AUS');
+}
+
 // ==============================
 // Session Events
 // ==============================
 renderer.xr.addEventListener('sessionstart', async () => {
   xrActive = true;
+
+  // Schild sichtbar, UI-Panel zunächst ausgeblendet – per Menütaste einblenden
   signMesh.visible = true;
-  buttonRoot.visible = true;
+  uiRoot.visible = false;
 
   xrSession = renderer.xr.getSession();
   refSpace = renderer.xr.getReferenceSpace();
@@ -651,18 +735,18 @@ renderer.xr.addEventListener('sessionstart', async () => {
       hitTestSource = await xrSession.requestHitTestSource({ space: viewerSpace });
       setSignText("👀 Schaue auf den Boden und platziere das Reticle.\nDrücke den TRIGGER der LINKEN Hand, um die Bodenhöhe zu setzen.");
     } else {
-      setSignText("ℹ️ Hit-Test nicht verfügbar – Boden bleibt bei y=0.\nLinker Trigger: Bälle • Rechter Trigger: Fläche • 🧹: Alle Bälle löschen");
+      setSignText("ℹ️ Hit-Test nicht verfügbar – Boden bleibt bei y=0.\nMenü (links): UI ein/aus • 🧹 Bälle löschen • 🧱 Mesh-Kollisionen");
     }
   } catch (e) {
     console.warn('Hit-Test Setup fehlgeschlagen:', e);
-    setSignText("ℹ️ Hit-Test nicht verfügbar – Boden bleibt bei y=0.\nLinker Trigger: Bälle • Rechter Trigger: Fläche • 🧹: Alle Bälle löschen");
+    setSignText("ℹ️ Hit-Test nicht verfügbar – Boden bleibt bei y=0.\nMenü (links): UI ein/aus • 🧹 Bälle löschen • 🧱 Mesh-Kollisionen");
   }
 });
 
 renderer.xr.addEventListener('sessionend', () => {
   xrActive = false;
   signMesh.visible = false;
-  buttonRoot.visible = false;
+  uiRoot.visible = false;
   reticle.visible = false;
 
   xrSession = null; viewerSpace = null; refSpace = null; hitTestSource = null;
@@ -695,7 +779,7 @@ renderer.setAnimationLoop((_, frame) => {
       const pose = results[0].getPose(refSpace);
       if (pose) {
         lastHitPose = pose;
-        // Reticle NUR vor dem Boden-Setzen zeigen
+        // Reticle nur solange Boden nicht gesetzt ist
         reticle.visible = !floorLocked;
         if (!floorLocked) {
           reticle.position.set(pose.transform.position.x, pose.transform.position.y, pose.transform.position.z);
@@ -703,7 +787,7 @@ renderer.setAnimationLoop((_, frame) => {
       }
     } else {
       lastHitPose = null;
-      reticle.visible = false; // nie „in der Luft“ anzeigen
+      reticle.visible = false;
     }
   }
 
@@ -718,33 +802,37 @@ renderer.setAnimationLoop((_, frame) => {
   // UI positionieren & Hover prüfen
   if (xrActive) {
     updateUIBillboard();
-    if (leftController)  updateUIHover(leftController);
-    if (rightController) updateUIHover(rightController);
-    pollMenuToggle(); // Button Sichtbarkeit per Menütaste / Longpress
+    if (uiRoot.visible) {
+      updateUIHover(controller0);
+      updateUIHover(controller1);
+    }
+    pollMenuToggle(); // UI-Panel per Menütaste/Squeeze togglen
   }
 
   renderer.render(scene, camera);
 });
 
 // ==============================
-// Menütaste / Fallback-Longpress
+// Menütaste / Fallback-Longpress → UI-Panel togglen
 // ==============================
 function pollMenuToggle() {
-  if (!leftController) return;
-  const gp = leftController.userData.gamepad;
+  // Linken Controller finden
+  const left = leftController;
+  if (!left) return;
+  const gp = left.userData.gamepad;
   let pressed = false;
 
   if (gp && gp.buttons && gp.buttons.length) {
-    // Bevorzugt eine „zusätzliche“ Taste (X/Menu). Robust über mehrere Indizes.
-    const candidates = [4,3,2]; // häufig: 4=X/Menu (links), 3=Y, 2=Thumbstick
+    // Kandidaten: X/Menu/Y/Thumbstick (robust)
+    const candidates = [4,3,2];
     for (const idx of candidates) {
       if (gp.buttons[idx] && gp.buttons[idx].pressed) { pressed = true; break; }
     }
   }
 
-  // Edge-Detection → Toggle
+  // Edge-Trigger → UI Panel togglen
   if (pressed && !menuPrev) {
-    buttonRoot.visible = !buttonRoot.visible;
+    uiRoot.visible = !uiRoot.visible;
   }
   menuPrev = pressed;
 
@@ -753,7 +841,7 @@ function pollMenuToggle() {
     if (gp.buttons[1].pressed) {
       squeezeTimer += fixedTimeStep;
       if (squeezeTimer >= 1.0) {
-        buttonRoot.visible = !buttonRoot.visible;
+        uiRoot.visible = !uiRoot.visible;
         squeezeTimer = 0;
       }
     } else {
