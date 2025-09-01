@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>BounceLab – AR Ballspiel</title>
+    <style>
+      html, body { margin: 0; padding: 0; height: 100%; background: #000; }
+      canvas { display: block; }
+      .notice {
+        position: fixed; left: 12px; bottom: 12px; z-index: 10;
+        padding: 8px 10px; font-family: system-ui, sans-serif; font-size: 12px;
+        background: rgba(0,0,0,0.5); color: #eee; border-radius: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="notice">Linke Hand = Block. Trigger drücken = Ball feuern. (Bälle despawnen nach 20 s)</div>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>
