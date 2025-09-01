@@ -5,18 +5,36 @@ import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFa
 import * as CANNON from 'https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js';
 
 // ==============================
-// Konfiguration
+// Konfiguration (Performance)
 // ==============================
 const USE_SIMPLE_VIZ = false;
 const ENABLE_MESH_DEBUG = false;
-const MAX_MESHES = 40;
-const MAX_TRIANGLES_PER_MESH = 3000;
-const ACCEPT_SEMANTICS = null;
 
-const BALL_SPAWN_OFFSET = 0.22;   // 22 cm vor der linken Hand
-const BALL_NO_COLLISION_MS = 120; // Anlaufphase ohne Kollision, um Phantom-Bounces zu vermeiden
+// --- Raum-Mesh Limits/Filter ---
+const MAX_MESHES = 40;                 // Max. aktive XR-Meshes
+const MAX_TRIANGLES_PER_MESH = 3000;   // Tri-Cap pro Mesh
+const MAX_MESH_DISTANCE = 6.0;         // m, darüber ignorieren/abbauen
+const DETECTED_MESH_UPDATE_RATE = 2;   // nur jeden 2. Frame verarbeiten
+const ACCEPT_SEMANTICS = ['floor', 'wall', 'table']; // Filter; setze null für alle
 
-// Mesh-Kollisions-Flag (per Button umschaltbar)
+// --- Physik-/Solver-Feinschliff ---
+const FIXED_DT = 1 / 60;
+const SOLVER_ITER = 7;                 // default 10 → leicht runter
+const SOLVER_TOL = 0.001;
+
+// --- Bälle ---
+const BALL_RADIUS   = 0.02;
+const BALL_MASS     = 0.003;
+const BALL_SPEED    = 3.5;
+const BALL_LIMIT    = 200;
+const BALL_LIFETIME = 20 * 1000;
+const BALL_SPAWN_OFFSET = 0.22;
+const BALL_NO_COLLISION_MS = 120;
+
+// --- UI ---
+const RAYCAST_INTERVAL_MS = 33;        // ~30 Hz Hover-Update
+
+// --- Mesh-Kollisions-Toggle (UI-Button steuert das) ---
 let meshCollisionsEnabled = true;
 
 // ==============================
@@ -26,7 +44,7 @@ const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.xr.enabled = true;
-renderer.setClearAlpha(0); // Passthrough
+renderer.setClearAlpha(0);
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -38,14 +56,14 @@ const dir = new THREE.DirectionalLight(0xffffff, 0.6);
 dir.position.set(1, 2, 1);
 scene.add(dir);
 
-// Debug-Grid
+// Boden-Grid
 const grid = new THREE.GridHelper(4, 8, 0x888888, 0x444444);
 grid.material.opacity = 0.25;
 grid.material.transparent = true;
 scene.add(grid);
 
 // ==============================
-// AR-Button / Session
+// AR-Session
 // ==============================
 const sessionInit = {
   optionalFeatures: [
@@ -64,9 +82,15 @@ let xrSession = null, viewerSpace = null, refSpace = null, hitTestSource = null;
 let xrActive = false;
 
 // ==============================
-// Physik (CANNON)
+// Physik (CANNON) – Performance
 // ==============================
 const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+// PERF: schnellere Broadphase & Sleep
+world.broadphase = new CANNON.SAPBroadphase(world);
+world.allowSleep = true;
+world.solver.iterations = SOLVER_ITER;
+world.solver.tolerance  = SOLVER_TOL;
+
 const matBall  = new CANNON.Material('ball');
 const matWorld = new CANNON.Material('world');
 world.defaultContactMaterial.contactEquationStiffness = 1e7;
@@ -76,13 +100,13 @@ world.addContactMaterial(new CANNON.ContactMaterial(matBall, matWorld, { frictio
 // Boden-Plane
 const groundBody = new CANNON.Body({ mass: 0, material: matWorld });
 groundBody.addShape(new CANNON.Plane());
-groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0); // normal +Y
+groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
 groundBody.position.set(0, 0, 0);
 world.addBody(groundBody);
 grid.position.y = 0;
 
 // ==============================
-// Reticle (Hit-Test)
+// Reticle
 // ==============================
 const reticleGeo = new THREE.RingGeometry(0.06, 0.08, 32);
 reticleGeo.rotateX(-Math.PI / 2);
@@ -95,7 +119,7 @@ let floorLocked = false;
 let lastHitPose = null;
 
 // ==============================
-// UI: Schild + Panel (2 Buttons) – sichtbar nur in XR
+// UI: Schild + Panel (🧹 / 🧱)
 // ==============================
 let signMesh, setSignText;
 ({ signMesh, setSignText } = createBillboardSign(
@@ -104,29 +128,29 @@ let signMesh, setSignText;
 signMesh.visible = false;
 scene.add(signMesh);
 
-// Panel mit zwei Buttons (🧹 & 🧱)
-const uiRoot = new THREE.Group(); // gemeinsam ein-/ausblendbar
-uiRoot.visible = false;           // per Menütaste togglen
+// Panel
+const uiRoot = new THREE.Group();
+uiRoot.visible = false;
 scene.add(uiRoot);
 
-// --- Button 1: Bälle löschen
+// Button 1: Bälle löschen
 const { buttonRoot: clearBtnRoot, buttonFront: clearBtnFront, setButtonState: setClearBtnState } = createClearBallsButton();
 uiRoot.add(clearBtnRoot);
 
-// --- Button 2: Mesh-Kollisionen an/aus
+// Button 2: Mesh-Kollisionen Toggle
 const { toggleRoot: meshBtnRoot, toggleFront: meshBtnFront, setToggleVisual } = createMeshToggleButton();
 uiRoot.add(meshBtnRoot);
 
-// Buttons nebeneinander anordnen
+// nebeneinander
 clearBtnRoot.position.x = -0.09;
 meshBtnRoot.position.x  =  0.09;
 
-// Interaktive Ziele (Raycast)
 let interactive = [clearBtnFront, meshBtnFront];
 
-// Raycaster (für Buttons)
+// Raycaster (throttled)
 const raycaster = new THREE.Raycaster();
 let hovered = null;
+let lastRayTs = 0;
 
 // ==============================
 // Controller / Eingaben
@@ -138,7 +162,6 @@ scene.add(controller0, controller1);
 const controllerGrip0 = renderer.xr.getControllerGrip(0);
 const controllerGrip1 = renderer.xr.getControllerGrip(1);
 
-// Hilfsfunktionen (vor Nutzung definiert)
 function addSimpleControllerViz(grip){
   const geo = new THREE.ConeGeometry(0.01, 0.08, 16);
   const mat = new THREE.MeshStandardMaterial({ color: 0x8888ff, metalness: 0, roughness: 0.9 });
@@ -174,16 +197,14 @@ if (USE_SIMPLE_VIZ) {
 }
 scene.add(controllerGrip0, controllerGrip1);
 
-// Sichtbare Rays
 buildControllerRay(controller0);
 buildControllerRay(controller1);
 
 let leftController = null, rightController = null;
 let leftGrip = null, rightGrip = null;
 
-// Gamepad-State für Menü/Toggle
 let menuPrev = false;
-let squeezeTimer = 0; // Fallback-Longpress
+let squeezeTimer = 0;
 
 function onConnected(event) {
   const src = event.data;
@@ -204,7 +225,6 @@ controller1.addEventListener('connected', onConnected);
 controller0.addEventListener('disconnected', function(){ this.remove(this.children[0]); });
 controller1.addEventListener('disconnected', function(){ this.remove(this.children[0]); });
 
-// Trigger-Handling
 controller0.addEventListener('selectstart', onSelectStart);
 controller1.addEventListener('selectstart', onSelectStart);
 
@@ -212,34 +232,25 @@ function onSelectStart(evt) {
   if (!xrActive) return;
   const target = evt.target;
 
-  // 1) Buttons per Raycast?
   if (tryPressUIButton(target)) return;
 
-  // 2) Boden setzen (nur linker Trigger, solange Reticle sichtbar)
   if (!floorLocked && target === leftController && reticle.visible) {
-    lockFloorAtReticle();
-    return;
+    lockFloorAtReticle(); return;
   }
-  // 3) Rechte Hand: Fläche platzieren (auch wenn Reticle unsichtbar ist; lastHitPose wird fortgeführt)
   if (target === rightController && lastHitPose) {
-    addPlaneColliderAtHit(lastHitPose);
-    return;
+    addPlaneColliderAtHit(lastHitPose); return;
   }
-  // 4) Linke Hand (nach Floor-Lock): Bälle schießen
   if (floorLocked && target === leftController) {
     fireFromLeft();
   }
 }
 
 // ==============================
-// Schüsse / Bälle
+// Bälle – Performance: Shared Geo/Mat + Sleep
 // ==============================
 const balls = []; // { mesh, body, bornAt }
-const BALL_RADIUS   = 0.02;
-const BALL_MASS     = 0.003;
-const BALL_SPEED    = 3.5;
-const BALL_LIMIT    = 200;
-const BALL_LIFETIME = 20 * 1000;
+const BALL_GEO = new THREE.SphereGeometry(BALL_RADIUS, 16, 12);
+const BALL_MAT = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.8, metalness: 0.0 });
 
 function syncMeshesFromPhysics() {
   for (let i = 0; i < balls.length; i++) {
@@ -252,9 +263,7 @@ function syncMeshesFromPhysics() {
 function spawnBall(origin, dir) {
   if (balls.length >= BALL_LIMIT) removeBall(balls[0]);
 
-  const sphereGeo = new THREE.SphereGeometry(BALL_RADIUS, 16, 12);
-  const sphereMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.8, metalness: 0.0 });
-  const mesh = new THREE.Mesh(sphereGeo, sphereMat);
+  const mesh = new THREE.Mesh(BALL_GEO, BALL_MAT);
   scene.add(mesh);
 
   const shape = new CANNON.Sphere(BALL_RADIUS);
@@ -265,7 +274,12 @@ function spawnBall(origin, dir) {
   body.velocity.set(dir.x * BALL_SPEED, dir.y * BALL_SPEED, dir.z * BALL_SPEED);
   body.angularVelocity.set((Math.random()-0.5)*5, (Math.random()-0.5)*5, (Math.random()-0.5)*5);
 
-  // No-collision Anlaufphase
+  // Sleep-Setup
+  body.allowSleep = true;
+  body.sleepSpeedLimit = 0.08; // < 8 cm/s
+  body.sleepTimeLimit  = 0.8;  // 0.8 s stabil → sleep
+
+  // Anlaufphase ohne Kollision
   body.collisionResponse = false;
   setTimeout(() => { body.collisionResponse = true; }, BALL_NO_COLLISION_MS);
 
@@ -278,8 +292,7 @@ function spawnBall(origin, dir) {
 
 function removeBall(item) {
   scene.remove(item.mesh);
-  item.mesh.geometry.dispose();
-  item.mesh.material.dispose();
+  // Geometrie/Material shared → NICHT dispose'n
   world.removeBody(item.body);
   const i = balls.indexOf(item);
   if (i !== -1) balls.splice(i, 1);
@@ -301,24 +314,24 @@ function fireFromLeft() {
 }
 
 // ==============================
-// Boden setzen (Reticle)
+// Boden setzen
+// ==============================
 function lockFloorAtReticle() {
   floorLocked = true;
   const y = reticle.position.y;
   groundBody.position.y = y;
   grid.position.y = y;
 
-  // Reticle & Schild ausblenden (Button-Panel bleibt per Menütaste steuerbar)
   reticle.visible = false;
   signMesh.visible = false;
 
-  setSignText("✅ Boden gesetzt.\nLinker Trigger: Bälle • Rechter Trigger: Fläche • 🧹/🧱-Panel: Menütaste (links)");
+  setSignText("✅ Boden gesetzt.\nLinker Trigger: Bälle • Rechter Trigger: Fläche • Menü (links): UI-Panel");
   showHint(`✅ Boden gesetzt (y=${y.toFixed(2)} m).`);
 }
 
 // ==============================
 // Manuelle Flächen (Box)
-const colliders = []; // { mesh, body }
+const colliders = [];
 const DEFAULT_W = 1.0, DEFAULT_H = 1.0, THICK = 0.02;
 
 function addPlaneColliderAtHit(pose) {
@@ -344,23 +357,45 @@ function addPlaneColliderAtHit(pose) {
 }
 
 // ==============================
-// M7: Raum-Mesh → CANNON.Trimesh
+// Raum-Mesh → CANNON.Trimesh (getunt)
 // ==============================
 const meshMap = new Map(); // XRMesh -> { body, debugMesh?, lastChangedTime }
+let meshFrameCounter = 0;
+const camPos = new THREE.Vector3();
 
 function handleDetectedMeshes(frame) {
+  // Throttle: nur jeden N-ten Frame
+  meshFrameCounter = (meshFrameCounter + 1) % DETECTED_MESH_UPDATE_RATE;
+  if (meshFrameCounter !== 0) return;
+
   const detected = frame.detectedMeshes;
   if (!detected) return;
+
+  camera.getWorldPosition(camPos);
 
   let count = 0;
   const seen = new Set();
 
   for (const xrmesh of detected) {
     if (count >= MAX_MESHES) break;
-    if (ACCEPT_SEMANTICS && xrmesh.semanticLabel && !ACCEPT_SEMANTICS.includes(xrmesh.semanticLabel)) continue;
+
+    // Semantik-Filter (falls verfügbar)
+    if (ACCEPT_SEMANTICS && xrmesh.semanticLabel && !ACCEPT_SEMANTICS.includes(xrmesh.semanticLabel)) {
+      continue;
+    }
 
     const pose = frame.getPose(xrmesh.meshSpace, refSpace);
     if (!pose) continue;
+
+    const p = pose.transform.position;
+    const dist = Math.hypot(p.x - camPos.x, p.y - camPos.y, p.z - camPos.z);
+
+    // Distanz-Culling
+    if (dist > MAX_MESH_DISTANCE) {
+      const stale = meshMap.get(xrmesh);
+      if (stale) { removeMeshRecord(xrmesh, stale); meshMap.delete(xrmesh); }
+      continue;
+    }
 
     const rec = meshMap.get(xrmesh);
     const changed = !rec || (xrmesh.lastChangedTime > (rec.lastChangedTime ?? -1));
@@ -371,14 +406,11 @@ function handleDetectedMeshes(frame) {
 
       const body = new CANNON.Body({ mass: 0, material: matWorld });
       body.addShape(shape);
-
-      // Pose
-      const p = pose.transform.position;
-      const q = pose.transform.orientation;
       body.position.set(p.x, p.y, p.z);
+      const q = pose.transform.orientation;
       body.quaternion.set(q.x, q.y, q.z, q.w);
 
-      // SOFORT den globalen Schalter respektieren:
+      // respektiere Mesh-Kollisions-Schalter
       body.collisionResponse = meshCollisionsEnabled;
 
       world.addBody(body);
@@ -388,8 +420,8 @@ function handleDetectedMeshes(frame) {
         const geom = new THREE.BufferGeometry();
         geom.setAttribute('position', new THREE.Float32BufferAttribute(xrmesh.vertices, 3));
         geom.setIndex(new THREE.BufferAttribute(xrmesh.indices, 1));
-        const mat = new THREE.MeshBasicMaterial({ wireframe: true, transparent: true, opacity: 0.15 });
-        debugMesh = new THREE.Mesh(geom, mat);
+        const dmat = new THREE.MeshBasicMaterial({ wireframe: true, transparent: true, opacity: 0.15 });
+        debugMesh = new THREE.Mesh(geom, dmat);
         debugMesh.position.set(p.x, p.y, p.z);
         debugMesh.quaternion.set(q.x, q.y, q.z, q.w);
         scene.add(debugMesh);
@@ -397,7 +429,7 @@ function handleDetectedMeshes(frame) {
 
       meshMap.set(xrmesh, { body, debugMesh, lastChangedTime: xrmesh.lastChangedTime });
     } else {
-      const p = pose.transform.position;
+      // Pose-Update
       const q = pose.transform.orientation;
       rec.body.position.set(p.x, p.y, p.z);
       rec.body.quaternion.set(q.x, q.y, q.z, q.w);
@@ -405,6 +437,8 @@ function handleDetectedMeshes(frame) {
         rec.debugMesh.position.set(p.x, p.y, p.z);
         rec.debugMesh.quaternion.set(q.x, q.y, q.z, q.w);
       }
+
+      // Geometrie nur aktualisieren, wenn sich etwas geändert hat
       if (changed) {
         world.removeBody(rec.body);
         const shape = createTrimeshShapeCapped(xrmesh.vertices, xrmesh.indices);
@@ -413,7 +447,6 @@ function handleDetectedMeshes(frame) {
           newBody.addShape(shape);
           newBody.position.set(p.x, p.y, p.z);
           newBody.quaternion.set(q.x, q.y, q.z, q.w);
-          // respektiere aktuellen Schalter
           newBody.collisionResponse = meshCollisionsEnabled;
           world.addBody(newBody);
           rec.body = newBody;
@@ -438,6 +471,7 @@ function handleDetectedMeshes(frame) {
     count++;
   }
 
+  // Entfernen nicht gesehener (oder zu weiter) Meshes
   for (const [meshKey, rec] of meshMap) {
     if (!seen.has(meshKey)) {
       removeMeshRecord(meshKey, rec);
@@ -451,6 +485,7 @@ function createTrimeshShapeCapped(verticesTyped, indicesTyped) {
   const triCount = (indicesTyped.length / 3) | 0;
   if (triCount === 0) return null;
 
+  // Cap / Downsample
   let indices;
   if (triCount > MAX_TRIANGLES_PER_MESH) {
     const stride = Math.ceil(triCount / MAX_TRIANGLES_PER_MESH);
@@ -478,7 +513,7 @@ function removeMeshRecord(meshKey, rec) {
 }
 
 // ==============================
-// UI-Interaktion (Buttons per Raycast)
+// UI-Interaktion (Buttons)
 // ==============================
 function tryPressUIButton(controller) {
   if (!xrActive || !uiRoot.visible) return false;
@@ -510,9 +545,8 @@ function tryPressUIButton(controller) {
 }
 
 function updateUIBillboard() {
-  if (!xrActive || !uiRoot.visible) return;
+  if (!xrActive) return;
 
-  // Schild ~0.7 m vor der Kamera (wenn sichtbar)
   const dist = 0.7;
   const offsetSign = new THREE.Vector3(-0.08, -0.12, -dist);
   const offsetPanel = new THREE.Vector3(0.02, -0.12, -dist);
@@ -522,12 +556,18 @@ function updateUIBillboard() {
     signMesh.quaternion.copy(camera.quaternion);
   }
 
-  uiRoot.position.copy(camera.localToWorld(offsetPanel.clone()));
-  uiRoot.quaternion.copy(camera.quaternion);
+  if (uiRoot.visible) {
+    uiRoot.position.copy(camera.localToWorld(offsetPanel.clone()));
+    uiRoot.quaternion.copy(camera.quaternion);
+  }
 }
 
-function updateUIHover(controller) {
-  if (!xrActive || !uiRoot.visible) return;
+function updateUIHoverThrottled(controller) {
+  const now = performance.now();
+  if (now - lastRayTs < RAYCAST_INTERVAL_MS) return;
+  lastRayTs = now;
+
+  if (!uiRoot.visible) return;
 
   const origin = new THREE.Vector3();
   const dir = new THREE.Vector3(0, 0, -1);
@@ -707,7 +747,6 @@ function flashButton(root) {
   tick();
 }
 
-// Umschalten der Mesh-Kollisionen (Physikreaktion)
 function toggleMeshCollisions() {
   meshCollisionsEnabled = !meshCollisionsEnabled;
   for (const [, rec] of meshMap) {
@@ -723,7 +762,6 @@ function toggleMeshCollisions() {
 renderer.xr.addEventListener('sessionstart', async () => {
   xrActive = true;
 
-  // Schild sichtbar, UI-Panel zunächst ausgeblendet – per Menütaste einblenden
   signMesh.visible = true;
   uiRoot.visible = false;
 
@@ -760,11 +798,9 @@ renderer.xr.addEventListener('sessionend', () => {
 // ==============================
 // Loop (Physik + Hit-Test + Mesh + UI + Gamepad-Poll)
 // ==============================
-const fixedTimeStep = 1 / 60;
-
 renderer.setAnimationLoop((_, frame) => {
   // Physik
-  world.step(fixedTimeStep);
+  world.step(FIXED_DT);
 
   // Bälle-Despawn
   const now = performance.now();
@@ -772,14 +808,13 @@ renderer.setAnimationLoop((_, frame) => {
     if (now - balls[i].bornAt > BALL_LIFETIME) removeBall(balls[i]);
   }
 
-  // XR Hit-Test (Reticle-Update)
+  // XR Hit-Test
   if (xrActive && frame && hitTestSource && refSpace) {
     const results = frame.getHitTestResults(hitTestSource);
     if (results && results.length > 0) {
       const pose = results[0].getPose(refSpace);
       if (pose) {
         lastHitPose = pose;
-        // Reticle nur solange Boden nicht gesetzt ist
         reticle.visible = !floorLocked;
         if (!floorLocked) {
           reticle.position.set(pose.transform.position.x, pose.transform.position.y, pose.transform.position.z);
@@ -791,7 +826,7 @@ renderer.setAnimationLoop((_, frame) => {
     }
   }
 
-  // Raum-Mesh verarbeiten
+  // Raum-Mesh (getunt verarbeitet)
   if (xrActive && frame && typeof frame.detectedMeshes !== 'undefined' && refSpace) {
     handleDetectedMeshes(frame);
   }
@@ -799,14 +834,14 @@ renderer.setAnimationLoop((_, frame) => {
   // Three <-> Physik sync (nur Bälle)
   syncMeshesFromPhysics();
 
-  // UI positionieren & Hover prüfen
+  // UI positionieren & Hover (throttled)
   if (xrActive) {
     updateUIBillboard();
     if (uiRoot.visible) {
-      updateUIHover(controller0);
-      updateUIHover(controller1);
+      updateUIHoverThrottled(controller0);
+      updateUIHoverThrottled(controller1);
     }
-    pollMenuToggle(); // UI-Panel per Menütaste/Squeeze togglen
+    pollMenuToggle();
   }
 
   renderer.render(scene, camera);
@@ -816,37 +851,25 @@ renderer.setAnimationLoop((_, frame) => {
 // Menütaste / Fallback-Longpress → UI-Panel togglen
 // ==============================
 function pollMenuToggle() {
-  // Linken Controller finden
   const left = leftController;
   if (!left) return;
   const gp = left.userData.gamepad;
   let pressed = false;
 
   if (gp && gp.buttons && gp.buttons.length) {
-    // Kandidaten: X/Menu/Y/Thumbstick (robust)
-    const candidates = [4,3,2];
+    const candidates = [4,3,2]; // X/Menu/Y/Stick (robust)
     for (const idx of candidates) {
       if (gp.buttons[idx] && gp.buttons[idx].pressed) { pressed = true; break; }
     }
   }
-
-  // Edge-Trigger → UI Panel togglen
-  if (pressed && !menuPrev) {
-    uiRoot.visible = !uiRoot.visible;
-  }
+  if (pressed && !menuPrev) uiRoot.visible = !uiRoot.visible;
   menuPrev = pressed;
 
-  // Fallback: Longpress auf Left-SQUEEZE (>=1s)
   if (gp && gp.buttons && gp.buttons[1]) {
     if (gp.buttons[1].pressed) {
-      squeezeTimer += fixedTimeStep;
-      if (squeezeTimer >= 1.0) {
-        uiRoot.visible = !uiRoot.visible;
-        squeezeTimer = 0;
-      }
-    } else {
-      squeezeTimer = 0;
-    }
+      squeezeTimer += FIXED_DT;
+      if (squeezeTimer >= 1.0) { uiRoot.visible = !uiRoot.visible; squeezeTimer = 0; }
+    } else squeezeTimer = 0;
   }
 }
 
