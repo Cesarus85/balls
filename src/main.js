@@ -234,7 +234,7 @@ function onSelectStart(evt) {
 // ==============================
 // Schüsse / Bälle
 // ==============================
-const balls = []; // { mesh, body, bornAt }
+const balls = []; // { mesh, body, bornAt, noCollideUntil }
 const BALL_RADIUS   = 0.02;
 const BALL_MASS     = 0.003;
 const BALL_SPEED    = 3.5;
@@ -267,11 +267,11 @@ function spawnBall(origin, dir) {
 
   // No-collision Anlaufphase
   body.collisionResponse = false;
-  setTimeout(() => { body.collisionResponse = true; }, BALL_NO_COLLISION_MS);
 
   world.addBody(body);
 
-  const item = { mesh, body, bornAt: performance.now() };
+  const now = performance.now();
+  const item = { mesh, body, bornAt: now, noCollideUntil: now + BALL_NO_COLLISION_MS };
   balls.push(item);
   return item;
 }
@@ -762,10 +762,16 @@ const fixedTimeStep = 1 / 60;
 
 renderer.setAnimationLoop((_, frame) => {
   // Physik
+  const now = performance.now();
+  for (let i = 0; i < balls.length; i++) {
+    const ball = balls[i];
+    if (!ball.body.collisionResponse && now >= ball.noCollideUntil) {
+      ball.body.collisionResponse = true;
+    }
+  }
   world.step(fixedTimeStep);
 
   // Bälle-Despawn
-  const now = performance.now();
   for (let i = balls.length - 1; i >= 0; i--) {
     if (now - balls[i].bornAt > BALL_LIFETIME) removeBall(balls[i]);
   }
