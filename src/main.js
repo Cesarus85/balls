@@ -1,7 +1,6 @@
 // --- Imports via Import-Map (siehe index.html) ---
 import * as THREE from 'three';
 import { ARButton } from 'three/addons/webxr/ARButton.js';
-// Wenn GLTF-Warnungen nerven: setze USE_SIMPLE_VIZ = true und kommentiere die nächste Zeile aus.
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 import * as CANNON from 'https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js';
 
@@ -13,6 +12,10 @@ const ENABLE_MESH_DEBUG = false;
 const MAX_MESHES = 40;
 const MAX_TRIANGLES_PER_MESH = 3000;
 const ACCEPT_SEMANTICS = null;
+
+// Ball-Start-Konfiguration gegen „Abprallen direkt vor mir“
+const BALL_SPAWN_OFFSET = 0.22;   // 22 cm vor der linken Hand
+const BALL_NO_COLLISION_MS = 120; // so lange zunächst keine Kollision
 
 // ==============================
 // Renderer / Scene / Camera
@@ -56,7 +59,7 @@ const arBtn = ARButton.createButton(renderer, sessionInit);
 document.body.appendChild(arBtn);
 
 let xrSession = null, viewerSpace = null, refSpace = null, hitTestSource = null;
-let xrActive = false; // <<< nur wenn true, UI anzeigen & updaten
+let xrActive = false;
 
 // ==============================
 // Physik (CANNON)
@@ -90,7 +93,7 @@ let floorLocked = false;
 let lastHitPose = null;
 
 // ==============================
-// UI: Schild + Button (vorab erzeugen, aber unsichtbar bis XR)
+// UI: Schild + Button (sichtbar nur in XR)
 // ==============================
 let signMesh, setSignText;
 let buttonRoot, buttonFront, setButtonState;
@@ -122,7 +125,7 @@ scene.add(controller0, controller1);
 const controllerGrip0 = renderer.xr.getControllerGrip(0);
 const controllerGrip1 = renderer.xr.getControllerGrip(1);
 
-// --- Hilfsfunktionen (VOR Nutzung definiert!) ---
+// Hilfsfunktionen (vor Nutzung)
 function addSimpleControllerViz(grip){
   const geo = new THREE.ConeGeometry(0.01, 0.08, 16);
   const mat = new THREE.MeshStandardMaterial({ color: 0x8888ff, metalness: 0, roughness: 0.9 });
@@ -131,7 +134,6 @@ function addSimpleControllerViz(grip){
   cone.position.z = -0.04;
   grip.add(cone);
 }
-
 function addLeftGunBlock(grip) {
   const geo = new THREE.BoxGeometry(0.10, 0.06, 0.16);
   const mat = new THREE.MeshStandardMaterial({ color: 0x4aa3ff, metalness: 0.0, roughness: 0.9 });
@@ -139,7 +141,6 @@ function addLeftGunBlock(grip) {
   block.position.set(0, 0, 0);
   grip.add(block);
 }
-
 function buildControllerRay(controller){
   const geometry = new THREE.BufferGeometry().setFromPoints([ new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,-1) ]);
   const material = new THREE.LineBasicMaterial({ transparent: true, opacity: 0.7 });
@@ -149,7 +150,6 @@ function buildControllerRay(controller){
   controller.add(line);
 }
 
-// Controller-Modelle / Visualisierung
 let controllerModelFactory = null;
 if (USE_SIMPLE_VIZ) {
   addSimpleControllerViz(controllerGrip0);
@@ -168,13 +168,21 @@ buildControllerRay(controller1);
 let leftController = null, rightController = null;
 let leftGrip = null, rightGrip = null;
 
+// Gamepad-State für Menü/Toggle
+let leftGamepad = null;
+let menuPrev = false;
+let squeezeTimer = 0; // für Longpress-Fallback
+
 function onConnected(event) {
   const src = event.data;
   this.userData.handedness = src.handedness;
+  this.userData.gamepad = src.gamepad || null;
+
   if (src.handedness === 'left') {
     leftController = this;
     leftGrip = (this === controller0) ? controllerGrip0 : controllerGrip1;
-    addLeftGunBlock(leftGrip); // << jetzt definitiv definiert
+    leftGamepad = src.gamepad || null;
+    addLeftGunBlock(leftGrip);
   } else if (src.handedness === 'right') {
     rightController = this;
     rightGrip = (this === controller0) ? controllerGrip0 : controllerGrip1;
@@ -191,7 +199,6 @@ controller1.addEventListener('selectstart', onSelectStart);
 
 function onSelectStart(evt) {
   if (!xrActive) return;
-
   const target = evt.target;
 
   // 1) Button per Raycast?
@@ -202,11 +209,11 @@ function onSelectStart(evt) {
     lockFloorAtReticle();
     return;
   }
-  // 3) Rechte Hand: Fläche platzieren
+  // 3) Rechte Hand: Fläche platzieren (Reticle ist unsichtbar, lastHitPose wird aber weiter aktualisiert)
   if (target === rightController && lastHitPose) {
-  addPlaneColliderAtHit(lastHitPose);
-  return;
-}
+    addPlaneColliderAtHit(lastHitPose);
+    return;
+  }
   // 4) Linke Hand (nach Floor-Lock): Bälle schießen
   if (floorLocked && target === leftController) {
     fireFromLeft();
@@ -242,9 +249,16 @@ function spawnBall(origin, dir) {
   const shape = new CANNON.Sphere(BALL_RADIUS);
   const body = new CANNON.Body({ mass: BALL_MASS, material: matBall });
   body.addShape(shape);
+
+  // Startposition + Richtung
   body.position.set(origin.x, origin.y, origin.z);
   body.velocity.set(dir.x * BALL_SPEED, dir.y * BALL_SPEED, dir.z * BALL_SPEED);
   body.angularVelocity.set((Math.random()-0.5)*5, (Math.random()-0.5)*5, (Math.random()-0.5)*5);
+
+  // Kurzzeitig keine Kollisionen zulassen, um „Abprallen direkt vor mir“ zu vermeiden
+  body.collisionResponse = false;
+  setTimeout(() => { body.collisionResponse = true; }, BALL_NO_COLLISION_MS);
+
   world.addBody(body);
 
   const item = { mesh, body, bornAt: performance.now() };
@@ -273,7 +287,8 @@ function fireFromLeft() {
   const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(
     new THREE.Quaternion().setFromRotationMatrix(leftGrip.matrixWorld)
   ).normalize();
-  const spawnPos = origin.clone().addScaledVector(dir, 0.12);
+  // weiter vom Körper entfernt starten
+  const spawnPos = origin.clone().addScaledVector(dir, BALL_SPAWN_OFFSET);
   spawnBall(spawnPos, dir);
 }
 
@@ -284,7 +299,12 @@ function lockFloorAtReticle() {
   const y = reticle.position.y;
   groundBody.position.y = y;
   grid.position.y = y;
-  setSignText("✅ Boden gesetzt.\nLinker Trigger: Bälle feuern\nRechter Trigger: Fläche platzieren (auf Reticle zielen)\n🧹 Button: Alle Bälle löschen");
+
+  // Reticle & Schild ausblenden, Button bleibt
+  reticle.visible = false;
+  signMesh.visible = false;
+
+  setSignText("✅ Boden gesetzt.\nLinker Trigger: Bälle feuern • Rechter Trigger: Fläche platzieren • 🧹: Alle Bälle löschen");
   showHint(`✅ Boden gesetzt (y=${y.toFixed(2)} m).`);
 }
 
@@ -329,7 +349,6 @@ function handleDetectedMeshes(frame) {
 
   for (const xrmesh of detected) {
     if (count >= MAX_MESHES) break;
-
     if (ACCEPT_SEMANTICS && xrmesh.semanticLabel && !ACCEPT_SEMANTICS.includes(xrmesh.semanticLabel)) continue;
 
     const pose = frame.getPose(xrmesh.meshSpace, refSpace);
@@ -458,7 +477,7 @@ function tryPressUIButton(controller) {
   const hits = raycaster.intersectObjects(interactive, false);
   if (hits.length > 0 && hits[0].object === buttonFront) {
     clearAllBalls();
-    setSignText("🧹 Alle Bälle gelöscht.\nLinker Trigger: Bälle • Rechter Trigger: Fläche • Reticle: Boden setzen");
+    setSignText("🧹 Alle Bälle gelöscht.\nLinker Trigger: Bälle • Rechter Trigger: Fläche • Reticle (nur vor Bodensetzen sichtbar).");
     flashButton(buttonRoot);
     return true;
   }
@@ -467,7 +486,6 @@ function tryPressUIButton(controller) {
 
 function updateUIBillboard() {
   if (!xrActive) return;
-  // Schild und Button ~0.7 m vor die Kamera
   const dist = 0.7;
   const offsetSign = new THREE.Vector3(-0.08, -0.12, -dist);
   const offsetButton = new THREE.Vector3(0.22, -0.12, -dist);
@@ -618,16 +636,6 @@ function flashButton(root) {
 }
 
 // ==============================
-// Resize
-// ==============================
-window.addEventListener('resize', onWindowResize, false);
-function onWindowResize() {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-}
-
-// ==============================
 // Session Events
 // ==============================
 renderer.xr.addEventListener('sessionstart', async () => {
@@ -659,7 +667,6 @@ renderer.xr.addEventListener('sessionend', () => {
 
   xrSession = null; viewerSpace = null; refSpace = null; hitTestSource = null;
 
-  // Meshes aufräumen
   for (const [meshKey, rec] of meshMap) removeMeshRecord(meshKey, rec);
   meshMap.clear();
 
@@ -667,7 +674,7 @@ renderer.xr.addEventListener('sessionend', () => {
 });
 
 // ==============================
-// Loop (Physik + Hit-Test + Mesh + UI)
+// Loop (Physik + Hit-Test + Mesh + UI + Gamepad-Poll)
 // ==============================
 const fixedTimeStep = 1 / 60;
 
@@ -675,29 +682,32 @@ renderer.setAnimationLoop((_, frame) => {
   // Physik
   world.step(fixedTimeStep);
 
-  // Despawn der Bälle
+  // Bälle-Despawn
   const now = performance.now();
   for (let i = balls.length - 1; i >= 0; i--) {
     if (now - balls[i].bornAt > BALL_LIFETIME) removeBall(balls[i]);
   }
 
-  // XR Hit-Test (Reticle)
+  // XR Hit-Test (Reticle-Update)
   if (xrActive && frame && hitTestSource && refSpace) {
     const results = frame.getHitTestResults(hitTestSource);
     if (results && results.length > 0) {
       const pose = results[0].getPose(refSpace);
       if (pose) {
         lastHitPose = pose;
-        reticle.visible = !!lastHitPose;
-        reticle.position.set(pose.transform.position.x, pose.transform.position.y, pose.transform.position.z);
+        // Reticle NUR vor dem Boden-Setzen zeigen
+        reticle.visible = !floorLocked;
+        if (!floorLocked) {
+          reticle.position.set(pose.transform.position.x, pose.transform.position.y, pose.transform.position.z);
+        }
       }
     } else {
-      if (!floorLocked) reticle.visible = false;
       lastHitPose = null;
+      reticle.visible = false; // nie „in der Luft“ anzeigen
     }
   }
 
-  // M7: Raum-Mesh verarbeiten
+  // Raum-Mesh verarbeiten
   if (xrActive && frame && typeof frame.detectedMeshes !== 'undefined' && refSpace) {
     handleDetectedMeshes(frame);
   }
@@ -705,15 +715,52 @@ renderer.setAnimationLoop((_, frame) => {
   // Three <-> Physik sync (nur Bälle)
   syncMeshesFromPhysics();
 
-  // UI (nur in Session) positionieren & Hover prüfen
+  // UI positionieren & Hover prüfen
   if (xrActive) {
     updateUIBillboard();
     if (leftController)  updateUIHover(leftController);
     if (rightController) updateUIHover(rightController);
+    pollMenuToggle(); // Button Sichtbarkeit per Menütaste / Longpress
   }
 
   renderer.render(scene, camera);
 });
+
+// ==============================
+// Menütaste / Fallback-Longpress
+// ==============================
+function pollMenuToggle() {
+  if (!leftController) return;
+  const gp = leftController.userData.gamepad;
+  let pressed = false;
+
+  if (gp && gp.buttons && gp.buttons.length) {
+    // Bevorzugt eine „zusätzliche“ Taste (X/Menu). Robust über mehrere Indizes.
+    const candidates = [4,3,2]; // häufig: 4=X/Menu (links), 3=Y, 2=Thumbstick
+    for (const idx of candidates) {
+      if (gp.buttons[idx] && gp.buttons[idx].pressed) { pressed = true; break; }
+    }
+  }
+
+  // Edge-Detection → Toggle
+  if (pressed && !menuPrev) {
+    buttonRoot.visible = !buttonRoot.visible;
+  }
+  menuPrev = pressed;
+
+  // Fallback: Longpress auf Left-SQUEEZE (>=1s)
+  if (gp && gp.buttons && gp.buttons[1]) {
+    if (gp.buttons[1].pressed) {
+      squeezeTimer += fixedTimeStep;
+      if (squeezeTimer >= 1.0) {
+        buttonRoot.visible = !buttonRoot.visible;
+        squeezeTimer = 0;
+      }
+    } else {
+      squeezeTimer = 0;
+    }
+  }
+}
 
 // ==============================
 // UI-Helfer (Hint unten links)
