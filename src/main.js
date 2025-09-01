@@ -251,6 +251,7 @@ const sharedBallShape = new CANNON.Sphere(BALL_RADIUS);
 const ballMesh = new THREE.InstancedMesh(sharedBallGeometry, sharedBallMaterial, BALL_LIMIT);
 ballMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 scene.add(ballMesh);
+ballMesh.count = 0;
 
 // Transform storage and free-slot recycling
 const ballTransforms = Array(BALL_LIMIT).fill(null);
@@ -296,6 +297,7 @@ function spawnBall(origin, dir) {
   const m = new THREE.Matrix4();
   m.compose(body.position, body.quaternion, _ballScale);
   ballMesh.setMatrixAt(index, m);
+  ballMesh.count = Math.max(ballMesh.count, index + 1);
   ballTransforms[index] = m;
   ballMesh.instanceMatrix.needsUpdate = true;
 
