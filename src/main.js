@@ -203,10 +203,10 @@ function onSelectStart(evt) {
     return;
   }
   // 3) Rechte Hand: Fläche platzieren
-  if (target === rightController && reticle.visible && lastHitPose) {
-    addPlaneColliderAtHit(lastHitPose);
-    return;
-  }
+  if (target === rightController && lastHitPose) {
+  addPlaneColliderAtHit(lastHitPose);
+  return;
+}
   // 4) Linke Hand (nach Floor-Lock): Bälle schießen
   if (floorLocked && target === leftController) {
     fireFromLeft();
@@ -688,7 +688,7 @@ renderer.setAnimationLoop((_, frame) => {
       const pose = results[0].getPose(refSpace);
       if (pose) {
         lastHitPose = pose;
-        reticle.visible = !floorLocked;
+        reticle.visible = !!lastHitPose;
         reticle.position.set(pose.transform.position.x, pose.transform.position.y, pose.transform.position.z);
       }
     } else {
